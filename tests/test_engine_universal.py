@@ -159,3 +159,35 @@ async def test_pause_mid_sentence_keeps_first_half(tmp_path):
     await eng._handle_utterance(np.zeros(8000, dtype=np.int16))
     assert ("user_text", ("what is the weather in Hyderabad today",)) in bridge.log
     api.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_or_hung_model_falls_back_to_backup(tmp_path, monkeypatch):
+    from deskbot import llm
+    monkeypatch.setattr(llm, "FIRST_TOKEN_TIMEOUT", 1.0)
+    llm.ChatOptions.cooldown.clear()
+    api = FakeAPI()
+    api.fail_models = {"busy-model"}
+    api.hang_models = {"hung-model"}
+    eng, bridge, player = make(tmp_path, api)
+    eng.cfg.set("brain.model", "busy-model", save=False)
+    eng.cfg.set("brain.fallback_models", "hung-model, fake-model", save=False)
+    await eng._respond("hi", eng.gen)
+    final = [a for n, a in bridge.log if n == "bot_text" and a[1]]
+    assert final and final[-1][0].startswith("Hello there")
+    assert not [a for n, a in bridge.log if n == "notice"]
+    # the failed models are tried last next time
+    assert llm.model_chain(eng.cfg)[0] == "fake-model"
+    api.close()
+
+
+def test_v1_settings_migrate_to_working_defaults(tmp_path):
+    import json as _json
+    p = tmp_path / "s.json"
+    p.write_text(_json.dumps({"brain": {"provider": "gemini", "model": "gemini-flash-latest",
+                                        "reasoning_effort": "none", "max_tokens": 350},
+                              "keys": {"gemini": "k"}}))
+    cfg = Settings(p).load()
+    assert cfg.get("brain.model") == "gemini-flash-lite-latest"
+    assert cfg.get("brain.reasoning_effort") == "default"
+    assert cfg.get("keys.gemini") == "k" and cfg.get("config_version") == 2

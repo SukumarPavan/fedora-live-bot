@@ -22,7 +22,16 @@
 - Whisper invents text on noise ("Thank you.", "Thanks for watching"). These are filtered out.
 - A pause mid-sentence ends the turn. If you keep talking before the bot answers, the first half is kept and merged with the second (carry-over).
 
-## APIs
+## APIs: measured with a real free key on 2026-10-30
+- **"It just floats and ignores me" (v0.1 bug):** the default `gemini-flash-latest` was overloaded (503). With `reasoning_effort=none` it hung for over 40 s with no bytes, then the SDK retried, so the bot sat "thinking" for minutes. Fixes: default `gemini-flash-lite-latest` (~0.9 s), backup models, a 12 s first-word timeout per model, failed models tried last for 3 min, and a v1→v2 settings migration.
+- `gemini-2.5-flash` returns 404 "no longer available to new users". The 3.6/3.7/3.8 flash models were slow (21 s) or hung (> 30 s). Lite models (flash-lite-latest, 3.5/3.1-flash-lite) answered in about 1 s, with vision.
+- `gemini-flash-lite-latest` rejects `reasoning_effort` with a vague 400. Any 400 while that optional parameter is sent now retries without it.
+- Groq has NO vision chat model now (gpt-oss, qwen3.8, allam only). Use Gemini as the brain if Screen or Cam should work. Groq Whisper: 1.2 s, exact transcripts.
+- Groq TTS (`canopylabs/orpheus`) needs terms accepted in the Groq console before use.
+- Gemini Live: `gemini-2.5-flash-native-audio-latest` (what "auto" picks) answered in 1.3 s with a correct transcript. `gemini-3.8-live` cut in after one word (too eager). `gemini-3.1-flash-live-preview` timed out.
+- Real Universal turn (VAD → Groq Whisper → Gemini lite → TTS): 2.6–3.6 s total.
+- A TTS engine that fails is skipped for 5 min, so a blocked Edge doesn't add a timeout to every sentence.
+- With the old language note the bot answered English questions in romanized Tenglish. The note now says: match the last message, Telugu only in Telugu script.
 - Free-tier limits and model names change. Defaults: `gemini-flash-latest` alias, Live model `auto` (picks a `bidiGenerateContent` model at connect time), plus Fetch-models buttons.
 - Gemini's OpenAI-compatible endpoint returns **400, not 401**, for a bad key; the reason is only in the body. `friendly_error` reads the body.
 - `reasoning_effort` and image input are retried without them if a provider rejects them (remembered per model).

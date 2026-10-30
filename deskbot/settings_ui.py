@@ -339,13 +339,17 @@ class SettingsDialog(QDialog):
             if model.count():
                 model.setCurrentIndex(0)
                 self.cfg.set("brain.model", model.currentText())
+            backups.setText(", ".join(m for _, m in self._provider_models(p, "chat")[1:3]))
+        backups = self._line("brain.fallback_models", placeholder="model-a, model-b")
+        backups.setToolTip("Used automatically when the main model is busy, slow or gone")
         fb.addRow("Provider", self._combo("brain.provider", PROVIDER_ITEMS, on_change=provider_changed))
         fb.addRow("Model", self._models_row("brain.model", "brain.provider", "chat"))
+        fb.addRow("Backup models", backups)
         fb.addRow("Creativity", self._slider("brain.temperature", 0.0, 1.5, 0.05, "{:.2f}"))
         fb.addRow("Max reply length (tokens)", self._slider("brain.max_tokens", 50, 2000, 25))
         fb.addRow("Memory (turns)", self._slider("brain.history_turns", 0, 40))
         fb.addRow("Thinking effort", self._combo("brain.reasoning_effort", [
-            ("Off (fastest replies)", "none"), ("Provider default", "default"), ("Low", "low"),
+            ("Provider default (recommended)", "default"), ("Off (some models reject this)", "none"), ("Low", "low"),
             ("Medium", "medium"), ("High", "high")]))
         fb.addRow(self._button("Test brain", self._test_brain, "Send a tiny test message"))
         return self._page(g, gk, gb)

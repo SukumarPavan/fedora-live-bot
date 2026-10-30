@@ -61,10 +61,11 @@ class BotWindow(QWidget):
     hover_changed = Signal(bool)
     moved = Signal()
 
-    def __init__(self, cfg: Settings, level_source):
+    def __init__(self, cfg: Settings, level_source, mic_source=lambda: 0.0):
         super().__init__(None)
         self.cfg = cfg
         self.level_source = level_source
+        self.mic_source = mic_source
         self.face = Face()
         self.painter = RobotPainter()
         self.mover = Mover()
@@ -130,6 +131,8 @@ class BotWindow(QWidget):
         f = self.face
         lvl = float(self.level_source() or 0.0)
         f.mouth_level += (lvl - f.mouth_level) * 0.5
+        mic = float(self.mic_source() or 0.0)
+        f.hear_level += (mic - f.hear_level) * (0.5 if mic > f.hear_level else 0.15)
         self._track_cursor(now)
         f.update(dt)
         self._move_tick(dt)

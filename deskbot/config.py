@@ -35,9 +35,8 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "label": "Groq",
         "base_url": "https://api.groq.com/openai/v1",
         "key_url": "https://console.groq.com/keys",
-        "chat_models": ["meta-llama/llama-4-scout-17b-16e-instruct",
-                        "meta-llama/llama-4-maverick-17b-128e-instruct",
-                        "llama-3.3-70b-versatile"],
+        # text only (Groq has no vision model as of 2026-10): screen/cam images are dropped
+        "chat_models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"],
         "stt_models": ["whisper-large-v3-turbo", "whisper-large-v3"],
         "tts_models": [],
     },
@@ -45,7 +44,10 @@ PROVIDERS: dict[str, dict[str, Any]] = {
         "label": "Google Gemini",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "key_url": "https://aistudio.google.com/apikey",
-        "chat_models": ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"],
+        # measured 2026-10-30 on a free key: lite models answer in ~1 s, big Flash models
+        # were overloaded (503) or hung > 30 s
+        "chat_models": ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+                        "gemini-3.5-flash", "gemini-flash-latest"],
         "stt_models": [],
         "tts_models": [],
     },
@@ -106,16 +108,21 @@ DEFAULT_PERSONALITY = (
 LANGUAGE_NOTES = {
     "english": "Reply in English.",
     "english_telugu": (
-        "The user speaks English, Telugu, or a mix (Tenglish). Reply in the same mix "
-        "they use. Write Telugu words in Telugu script so they are pronounced correctly; "
-        "write English words in English."),
+        "The user speaks English, Telugu, or a mix (Tenglish). Match the language of their "
+        "LAST message: if it was English only, reply in English only; if it had Telugu, you may "
+        "mix. Always write Telugu words in Telugu script (తెలుగు), never in English letters, "
+        "or the voice will mispronounce them."),
     "english_hindi": (
-        "The user speaks English, Hindi, or a mix (Hinglish). Reply in the same mix they "
-        "use. Write Hindi words in Devanagari script; English words in English."),
+        "The user speaks English, Hindi, or a mix (Hinglish). Match the language of their "
+        "LAST message: if it was English only, reply in English only. Always write Hindi words "
+        "in Devanagari script, never in English letters."),
     "auto": "Reply in whatever language the user speaks, using its native script.",
 }
 
+CONFIG_VERSION = 2
+
 DEFAULTS: dict[str, Any] = {
+    "config_version": CONFIG_VERSION,
     "bot": {
         "name": "Ultron Jr",
         "personality": DEFAULT_PERSONALITY,
@@ -153,11 +160,12 @@ DEFAULTS: dict[str, Any] = {
     "custom_base_url": "",
     "brain": {
         "provider": "gemini",
-        "model": "gemini-flash-latest",
+        "model": "gemini-flash-lite-latest",
+        "fallback_models": "gemini-3.5-flash-lite, gemini-3.1-flash-lite",
         "temperature": 0.8,
-        "max_tokens": 350,
+        "max_tokens": 600,
         "history_turns": 12,
-        "reasoning_effort": "none",  # default | none | low | medium | high
+        "reasoning_effort": "default",  # default | none | low | medium | high
     },
     "ears": {
         "provider": "groq",
@@ -256,7 +264,9 @@ class Settings:
     def load(self) -> "Settings":
         try:
             if self.path.exists():
-                self.data = _merge(DEFAULTS, json.loads(self.path.read_text("utf-8")))
+                raw = json.loads(self.path.read_text("utf-8"))
+                self.data = _merge(DEFAULTS, raw)
+                self._migrate(int(raw.get("config_version", 1)))
         except Exception as e:  # corrupt file: keep defaults, keep a backup
             log.error("Could not read settings (%s); using defaults", e)
             try:
@@ -264,6 +274,19 @@ class Settings:
             except OSError:
                 pass
         return self
+
+    def _migrate(self, version: int) -> None:
+        if version < 2:
+            # v1 defaults hung or failed on free Gemini keys (see PROVIDERS["gemini"])
+            b = self.data["brain"]
+            if b.get("provider") == "gemini" and b.get("model") in ("gemini-flash-latest", "gemini-2.5-flash"):
+                b["model"] = DEFAULTS["brain"]["model"]
+            if b.get("reasoning_effort") == "none":
+                b["reasoning_effort"] = "default"
+            if b.get("max_tokens") == 350:
+                b["max_tokens"] = 600
+            log.info("Settings migrated to version 2")
+        self.data["config_version"] = CONFIG_VERSION
 
     def save(self) -> None:
         with self._lock:

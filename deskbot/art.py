@@ -79,6 +79,7 @@ class Face:
         self._next_saccade = 1.0
         self.forced_look: tuple[float, float] | None = None
         self.mouth_level = 0.0     # 0..1 audio loudness (lip sync)
+        self.hear_level = 0.0      # mic loudness: the ears glow while you talk
         self.listening = False
         self.speaking = False
         self.screen_on = False
@@ -343,6 +344,7 @@ class RobotPainter:
             p.setBrush(QBrush(_metal(self.tint, 80, 112)))
             p.drawEllipse(QPointF(ex, 96), 11, 15)
             lvl = 0.35 + (0.65 * (0.5 + 0.5 * math.sin(face.t * 6)) if face.listening else 0)
+            lvl = max(lvl, min(1.4, 0.35 + face.hear_level * 25))
             _glow(p, QPointF(ex, 96), 14, self.eye, lvl * self.glow_amt)
             p.setPen(QPen(QColor(self.eye), 2.0))
             p.setBrush(Qt.NoBrush)

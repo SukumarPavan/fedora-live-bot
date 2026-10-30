@@ -44,7 +44,8 @@ class Controller(QObject):
         self.screen_on = False
         self.cam_on = False
         self.host = EngineHost()
-        self.bot = BotWindow(cfg, lambda: self.player.level)
+        self.bot = BotWindow(cfg, lambda: self.player.level,
+                             lambda: self.mic_level if self.cfg.get("listen.mic_on", True) else 0.0)
         self.toolbar = ToolBar(cfg)
         self.bubble = Bubble(cfg)
         self.chat: ChatWindow | None = None
@@ -57,6 +58,12 @@ class Controller(QObject):
 
         self._hide_bar = QTimer(self, singleShot=True, interval=1300)
         self._hide_bar.timeout.connect(self._maybe_hide_bar)
+        self.mic_level = 0.0
+        self.mic_peak = 0.0
+        self.mic_blocks = 0
+        self._mic_warned = False
+        self._mic_check = QTimer(self, interval=20000)
+        self._mic_check.timeout.connect(self._check_mic)
         self._sleep_timer = QTimer(self, interval=5000)
         self._sleep_timer.timeout.connect(self._check_sleep)
         self._recorded.connect(lambda cb, pcm: cb(pcm))
@@ -84,6 +91,7 @@ class Controller(QObject):
         self.restart_audio()
         self.restart_engine()
         self._sleep_timer.start()
+        self._mic_check.start()
         QTimer.singleShot(600, self._greet)
 
     def _greet(self) -> None:
@@ -129,9 +137,31 @@ class Controller(QObject):
     def _on_mic_block(self, block: np.ndarray) -> None:  # audio thread
         for tap in list(self._taps):
             tap.append(block)
+        lvl = float(np.sqrt(np.mean(block.astype(np.float32) ** 2))) / 32768.0
+        self.mic_level = lvl
+        self.mic_blocks += 1
+        self.mic_peak = max(self.mic_peak, lvl)
         eng = self.host.engine
         if eng is not None and self.cfg.get("listen.mic_on", True):
             self.host.call(eng.on_mic_block, block)
+
+    def _check_mic(self) -> None:
+        """Every 20 s: warn once if the microphone delivers nothing or pure silence."""
+        blocks, peak = self.mic_blocks, self.mic_peak
+        self.mic_blocks, self.mic_peak = 0, 0.0
+        if not self.cfg.get("listen.mic_on", True) or AUDIO_ERROR or self._mic_warned:
+            return
+        if blocks == 0:
+            msg = "My microphone isn't sending any sound. Pick another mic in Settings → Hearing."
+        elif peak < 0.0005:
+            msg = ("My microphone is completely silent. Is it muted, or is the wrong mic selected? "
+                   "Settings → Hearing → Test hearing.")
+        else:
+            log.info("Mic OK: %d blocks, peak level %.4f in the last 20 s", blocks, peak)
+            return
+        log.warning(msg)
+        self._mic_warned = True
+        self._on_notice(msg)
 
     def record(self, seconds: float, cb) -> None:
         tap: list = []

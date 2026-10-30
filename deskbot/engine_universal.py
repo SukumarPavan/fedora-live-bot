@@ -116,12 +116,14 @@ class UniversalEngine:
                 continue
             for kind, audio in self.ep.feed(block, bot_speaking=speaking):
                 if kind == "start":
+                    log.info("Speech started (voice probability %.2f)", self.ep.last_prob)
                     self.last_activity = time.monotonic()
                     if speaking or self.busy:
                         log.info("Barge-in: user started talking")
                         self.interrupt()
                     self.bridge.state.emit("listening")
                 elif kind == "utterance":
+                    log.info("Speech ended: %.1f s of audio, sending to speech-to-text", len(audio) / 16000)
                     self.ptt_armed = False
                     self._spawn(self._handle_utterance(audio))
                 elif not self.busy:
@@ -149,6 +151,7 @@ class UniversalEngine:
             return
         if gen != self.gen:
             return
+        log.info("Heard: %r", text)
         if is_hallucination(text):
             log.info("Ignored noise transcript: %r", text)
             text = ""
@@ -263,6 +266,7 @@ class UniversalEngine:
                 self.history.append({"role": "user", "content": "(check-in)" + note})
             self.history.append({"role": "assistant", "content": reply})
             self.bridge.bot_text.emit(reply, True)
+            log.info("Replied: %r", reply[:200])
             vision_note = llm.vision_note(self.cfg)
             if vision_note and images:
                 self.bridge.notice.emit(vision_note)

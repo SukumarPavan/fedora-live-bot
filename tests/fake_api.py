@@ -10,6 +10,8 @@ class FakeAPI:
         self.reply = reply
         self.transcript = transcript
         self.requests = []
+        self.fail_models = set()     # these answer 503 (overloaded)
+        self.hang_models = set()     # these never answer
         api = self
 
         class H(BaseHTTPRequestHandler):
@@ -27,6 +29,14 @@ class FakeAPI:
                 if self.path.endswith("/audio/transcriptions"):
                     self._send(200, json.dumps({"text": api.transcript}).encode(), "application/json")
                 elif self.path.endswith("/chat/completions"):
+                    model = json.loads(raw).get("model")
+                    if model in api.hang_models:
+                        import time
+                        time.sleep(5)
+                        return
+                    if model in api.fail_models:
+                        self._send(503, b'{"error":{"message":"high demand"}}', "application/json")
+                        return
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.end_headers()

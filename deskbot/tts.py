@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
 
 import numpy as np
 
@@ -34,6 +35,7 @@ class TTS:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
         self.last_error = ""
+        self.down_until: dict[str, float] = {}
 
     async def synth(self, text: str) -> np.ndarray:
         text = clean_for_tts(text)
@@ -42,16 +44,20 @@ class TTS:
         order = {"edge": ["edge", "openai", "espeak"], "openai": ["openai", "edge", "espeak"],
                  "espeak": ["espeak", "edge"]}.get(self.cfg.get("voice.engine"), ["edge", "espeak"])
         errors = []
-        for engine in order:
+        now = time.monotonic()
+        healthy = [e for e in order if self.down_until.get(e, 0) <= now]
+        for engine in healthy + [e for e in order if e not in healthy]:
             try:
                 pcm = await getattr(self, f"_{engine}")(text)
                 if len(pcm):
                     if engine != order[0]:
-                        log.warning("TTS fell back to %s", engine)
+                        log.warning("TTS used fallback %s", engine)
+                    self.down_until.pop(engine, None)
                     return robotize(pcm, float(self.cfg.get("voice.robot_effect", 0.0)))
             except Exception as e:
                 errors.append(f"{engine}: {e}")
-                log.warning("TTS %s failed: %s", engine, e)
+                self.down_until[engine] = time.monotonic() + 300
+                log.warning("TTS %s failed (skipping it for 5 min): %s", engine, e)
         self.last_error = "; ".join(errors)
         raise ApiError("I lost my voice (all speech engines failed). Check internet or Settings → Voice.")
 
@@ -60,7 +66,8 @@ class TTS:
         v = self.cfg.get
         voice = pick_voice(text, v("voice.edge_voice"), v("voice.edge_voice_alt"), v("voice.alt_auto"))
         com = edge_tts.Communicate(text, voice, rate=f"{int(v('voice.rate', 0)):+d}%",
-                                   pitch=f"{int(v('voice.pitch', 0)):+d}Hz")
+                                   pitch=f"{int(v('voice.pitch', 0)):+d}Hz", connect_timeout=5,
+                                   receive_timeout=15)
         chunks = []
         async for ch in com.stream():
             if ch["type"] == "audio":

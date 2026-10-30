@@ -4,8 +4,10 @@ Works with any provider that speaks the OpenAI REST dialect (Groq, Gemini's Open
 endpoint, OpenRouter, OpenAI, Mistral, DeepSeek, Together, Cerebras, xAI, self-hosted...)."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+import time
 from typing import AsyncIterator
 
 import numpy as np
@@ -21,7 +23,8 @@ class ApiError(RuntimeError):
     """An error with a message that is safe and friendly to show to the user."""
 
 
-def make_client(cfg: Settings, provider: str, timeout: float = 60.0) -> openai.AsyncOpenAI:
+def make_client(cfg: Settings, provider: str, timeout: float = 60.0,
+                max_retries: int = 1) -> openai.AsyncOpenAI:
     base = cfg.base_url(provider)
     key = cfg.key(provider)
     label = PROVIDERS.get(provider, {}).get("label", provider)
@@ -29,7 +32,7 @@ def make_client(cfg: Settings, provider: str, timeout: float = 60.0) -> openai.A
         raise ApiError(f"No base URL set for {label}. Open Settings → Brain.")
     if not key:
         raise ApiError(f"No API key for {label}. Open Settings → Brain and paste your key.")
-    return openai.AsyncOpenAI(base_url=base, api_key=key, timeout=timeout, max_retries=1)
+    return openai.AsyncOpenAI(base_url=base, api_key=key, timeout=timeout, max_retries=max_retries)
 
 
 def friendly_error(e: Exception, provider: str) -> str:
@@ -44,7 +47,7 @@ def friendly_error(e: Exception, provider: str) -> str:
         return f"{label} doesn't know that model. Pick another in Settings (Fetch models)."
     if isinstance(e, openai.APIConnectionError):
         return f"Can't reach {label}. Is the internet on?"
-    if isinstance(e, openai.APITimeoutError):
+    if isinstance(e, (openai.APITimeoutError, asyncio.TimeoutError)):
         return f"{label} took too long to answer."
     if isinstance(e, openai.APIStatusError):
         text = _short(e).lower()
@@ -99,10 +102,16 @@ async def transcribe(cfg: Settings, pcm16: np.ndarray) -> str:
     return (getattr(res, "text", None) or str(res)).strip()
 
 
+FIRST_TOKEN_TIMEOUT = 12.0   # a model that hasn't started answering by now is skipped
+BACKUP_ERRORS = (openai.RateLimitError, openai.InternalServerError, openai.NotFoundError,
+                 openai.APITimeoutError, openai.APIConnectionError, asyncio.TimeoutError)
+
+
 class ChatOptions:
-    """Remembers per-provider/model incompatibilities found at runtime."""
+    """Remembers per-provider/model problems found at runtime."""
     no_reasoning_param: set[str] = set()
     no_vision: set[str] = set()
+    cooldown: dict[str, float] = {}   # ident -> monotonic time until which it is skipped
 
 
 def _strip_images(messages: list[dict]) -> list[dict]:
@@ -116,46 +125,86 @@ def _strip_images(messages: list[dict]) -> list[dict]:
     return out
 
 
-async def chat_stream(cfg: Settings, messages: list[dict]) -> AsyncIterator[str]:
+def model_chain(cfg: Settings) -> list[str]:
+    """Main model first, then backups; models that just failed go to the back."""
     provider = cfg.get("brain.provider")
-    model = cfg.get("brain.model")
+    main = cfg.get("brain.model")
+    extra = [m.strip() for m in str(cfg.get("brain.fallback_models") or "").split(",") if m.strip()]
+    chain = [main] + [m for m in extra if m != main]
+    now = time.monotonic()
+    ok = [m for m in chain if ChatOptions.cooldown.get(f"{provider}:{m}", 0) <= now]
+    return ok + [m for m in chain if m not in ok]
+
+
+async def _open_stream(client, cfg: Settings, model: str, messages: list[dict]):
+    provider = cfg.get("brain.provider")
     ident = f"{provider}:{model}"
-    client = make_client(cfg, provider)
     kwargs = {"model": model, "temperature": float(cfg.get("brain.temperature", 0.8)),
-              "max_tokens": int(cfg.get("brain.max_tokens", 350)), "stream": True}
+              "max_tokens": int(cfg.get("brain.max_tokens", 600)), "stream": True}
     effort = cfg.get("brain.reasoning_effort", "default")
     if effort and effort != "default" and ident not in ChatOptions.no_reasoning_param:
         kwargs["reasoning_effort"] = effort
     if ident in ChatOptions.no_vision:
         messages = _strip_images(messages)
-    try:
-        for attempt in range(3):
-            try:
-                stream = await client.chat.completions.create(messages=messages, **kwargs)
-                break
-            except openai.BadRequestError as e:
-                text = _short(e).lower()
-                if "reasoning" in text and "reasoning_effort" in kwargs:
-                    log.warning("%s rejects reasoning_effort; retrying without it", ident)
-                    ChatOptions.no_reasoning_param.add(ident)
-                    kwargs.pop("reasoning_effort")
-                    continue
-                if any(w in text for w in ("image", "vision", "multimodal", "content type")) \
-                        and ident not in ChatOptions.no_vision:
-                    log.warning("%s seems to have no vision; retrying without images", ident)
-                    ChatOptions.no_vision.add(ident)
-                    messages = _strip_images(messages)
-                    continue
-                raise
-        else:
-            raise ApiError("The AI rejected the request.")
-        async for chunk in stream:
-            if not chunk.choices:
+    for _ in range(3):
+        try:
+            return await asyncio.wait_for(client.chat.completions.create(messages=messages, **kwargs),
+                                          FIRST_TOKEN_TIMEOUT)
+        except openai.BadRequestError as e:
+            text = _short(e).lower()
+            if "reasoning_effort" in kwargs:  # optional; many models reject it with a vague 400
+                log.warning("%s rejected reasoning_effort; retrying without it", ident)
+                ChatOptions.no_reasoning_param.add(ident)
+                kwargs.pop("reasoning_effort")
                 continue
-            delta = chunk.choices[0].delta
-            text = getattr(delta, "content", None)
-            if text:
-                yield text
+            has_images = any(isinstance(m.get("content"), list) for m in messages)
+            if has_images and any(w in text for w in ("image", "vision", "multimodal", "content")):
+                log.warning("%s seems to have no vision; retrying without images", ident)
+                ChatOptions.no_vision.add(ident)
+                messages = _strip_images(messages)
+                continue
+            raise
+    raise ApiError("The AI rejected the request.")
+
+
+async def chat_stream(cfg: Settings, messages: list[dict]) -> AsyncIterator[str]:
+    provider = cfg.get("brain.provider")
+    client = make_client(cfg, provider, timeout=30, max_retries=0)
+    last: Exception | None = None
+    try:
+        for model in model_chain(cfg):
+            ident = f"{provider}:{model}"
+            started = False
+            try:
+                t0 = time.monotonic()
+                it = (await _open_stream(client, cfg, model, messages)).__aiter__()
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(it.__anext__(), 30 if started else FIRST_TOKEN_TIMEOUT)
+                    except StopAsyncIteration:
+                        break
+                    text = chunk.choices[0].delta.content if chunk.choices else None
+                    if text:
+                        if not started:
+                            log.info("Brain %s answered in %.1fs", model, time.monotonic() - t0)
+                        started = True
+                        yield text
+                if started:
+                    ChatOptions.cooldown.pop(ident, None)
+                    return
+                last = ApiError(f"{model} gave an empty answer")
+                log.warning("Brain %s gave an empty answer; trying a backup", model)
+            except BACKUP_ERRORS as e:
+                if started:
+                    raise ApiError(friendly_error(e, provider)) from e
+                log.warning("Brain %s failed (%s); trying a backup", model, type(e).__name__)
+                ChatOptions.cooldown[ident] = time.monotonic() + 180
+                last = e
+        if isinstance(last, ApiError):
+            raise last
+        if isinstance(last, asyncio.TimeoutError):
+            raise ApiError("My brain is too busy right now (all models timed out). Try again in a moment.")
+        raise ApiError(friendly_error(last, provider) if last else "No brain model configured.")
     except ApiError:
         raise
     except Exception as e:
