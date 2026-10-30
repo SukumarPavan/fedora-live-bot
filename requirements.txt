@@ -1,0 +1,11 @@
+PySide6-Essentials>=6.7,<7
+numpy>=1.26,<3
+openai>=1.40,<4
+google-genai>=1.20,<3
+edge-tts>=7.0,<8
+miniaudio>=1.60,<2
+onnxruntime>=1.18,<2
+sounddevice>=0.4.7,<1
+opencv-python-headless>=4.9,<6
+mss>=9.0,<11
+jeepney>=0.8,<1; sys_platform == "linux"
