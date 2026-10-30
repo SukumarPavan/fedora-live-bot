@@ -6,6 +6,7 @@ import os
 import random
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import QApplication, QMenu
 
+from . import pulse_mic
 from .audio_io import AUDIO_ERROR, Mic, Player
 from .bot_window import BotWindow, Bubble, ToolBar
 from .bridge import Bridge
@@ -37,7 +39,11 @@ class Controller(QObject):
         self.bridge = Bridge()
         self.player = Player()
         self.player.gain = float(cfg.get("voice.volume", 100)) / 100
-        self.mic = Mic(self._on_mic_block)
+        # Linux: record straight from PipeWire so a bad system default can't silence the bot
+        self.use_pulse = pulse_mic.available()
+        self.mic = pulse_mic.PulseMic(self._on_mic_block) if self.use_pulse else Mic(self._on_mic_block)
+        self.mic_name = ""
+        self._mic_lock = threading.Lock()
         self._taps: list[list] = []
         self.screen = Screen(cfg, lambda m: self.bridge.eyes_failed.emit("screen:" + m))
         self.camera = Camera(lambda m: self.bridge.eyes_failed.emit("cam:" + m))
@@ -54,6 +60,7 @@ class Controller(QObject):
         self.last_activity = time.monotonic()
         self.sleeping = False
         self._pending_user = ""
+        self._listening_hint = False
         self._hovering = {"bot": False, "bar": False}
 
         self._hide_bar = QTimer(self, singleShot=True, interval=1300)
@@ -122,17 +129,42 @@ class Controller(QObject):
 
     # ----------------------------------------------------------------------------- audio
     def restart_audio(self) -> None:
+        self._mic_warned = False
         if AUDIO_ERROR:
             self._on_notice(AUDIO_ERROR)
+        else:
+            try:
+                self.player.start(self.cfg.get("listen.output_device", ""))
+            except Exception as e:
+                self._on_notice(f"Speaker problem: {e}")
+        if self.use_pulse:
+            # probing takes a second or two per mic: keep the UI responsive
+            threading.Thread(target=self._start_pulse_mic, daemon=True, name="mic-probe").start()
             return
-        try:
-            self.player.start(self.cfg.get("listen.output_device", ""))
-        except Exception as e:
-            self._on_notice(f"Speaker problem: {e}")
+        if AUDIO_ERROR:
+            return
         try:
             self.mic.start(self.cfg.get("listen.input_device", ""))
         except Exception as e:
             self._on_notice(f"Microphone problem: {e}")
+
+    def _start_pulse_mic(self) -> None:  # background thread
+        with self._mic_lock:
+            self.mic.stop()
+            name, report, notice = pulse_mic.choose_source(self.cfg.get("listen.input_device", ""))
+            for line in report:
+                log.info("Mic check: %s", line)
+            if not name:
+                self.bridge.notice.emit("I can't find any microphone. Plug one in, then Settings → Hearing.")
+                return
+            try:
+                self.mic.start(name)
+                self.mic_name = name
+            except Exception as e:
+                self.bridge.notice.emit(f"Microphone problem: {e}")
+                return
+            if notice:
+                self.bridge.notice.emit(notice)
 
     def _on_mic_block(self, block: np.ndarray) -> None:  # audio thread
         for tap in list(self._taps):
@@ -273,6 +305,14 @@ class Controller(QObject):
         self.bot.talking = s != "idle"
         if s != "idle":
             self._wake()
+        if s == "listening" and not self.bubble.isVisible():
+            self._listening_hint = True
+            self.bubble.show_text(user="", bot="(listening…)", final=False)
+            self._follow()
+        elif s == "idle" and self._listening_hint:
+            self.bubble.clear()
+        if s != "listening":
+            self._listening_hint = False
         if s == "thinking":
             f.set_emotion("thinking")
         elif f.base_emotion == "thinking":
@@ -298,6 +338,7 @@ class Controller(QObject):
     # ----------------------------------------------------------------------------- text
     def _on_user_text(self, text: str) -> None:
         self._wake()
+        self._listening_hint = False
         self._pending_user = text
         self.bubble.show_text(user=text, bot="", final=False)
         self._follow()

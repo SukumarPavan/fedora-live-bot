@@ -17,6 +17,9 @@
 - Laptop IPU6/MIPI webcams often are not V4L2-compatible, so OpenCV can't open them.
 
 ## Audio
+- **Real bug on the user's Fedora (2026-10-31):** install.sh made the PipeWire echo-cancel source the SYSTEM default mic, and it delivered pure digital silence. The bot never heard anything, and Test hearing sent silence to Whisper, which made up words. Fixed: never set it as default. The installer and the app restore a real default. On Linux the mic is recorded with `parecord` from a named PipeWire source. "Auto" probes each source and picks one with sound (peak ≥ 1e-4). Settings has a live mic meter, and Test hearing refuses to transcribe silence.
+- The launcher `cd`s into the installed app: `python -m deskbot` run inside a repo checkout otherwise imports the checkout, not the installed copy.
+- If no speaker opens, `Player.play` drops audio. Before, it set `active=True` forever and the engine hung after its first reply.
 - Speakers + mic means the bot hears itself. Defences: PipeWire echo-cancel (`monitor.mode`, `nofail`, set as default mic), a stricter barge-in threshold while the bot speaks, a half-duplex option, or headphones.
 - A broken PipeWire module config can stop all audio. That's why the installer adds `flags = [ nofail ]`.
 - Whisper invents text on noise ("Thank you.", "Thanks for watching"). These are filtered out.

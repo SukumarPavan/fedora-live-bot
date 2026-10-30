@@ -152,6 +152,9 @@ class Player:
     def play(self, pcm: np.ndarray) -> None:
         if len(pcm) == 0:
             return
+        if self.stream is None:  # no speaker: never mark as playing, or engines wait forever
+            log.warning("No speaker open; dropping %.1f s of speech", len(pcm) / OUT_SR)
+            return
         if self._rate != OUT_SR:
             pcm = resample(pcm, OUT_SR, self._rate)
         with self._lock:

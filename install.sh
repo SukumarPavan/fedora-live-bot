@@ -72,6 +72,7 @@ mkdir -p "$BIN" "$HOME/.local/share/applications" "$HOME/.local/share/icons/hico
 cat > "$BIN/deskbot" <<EOF
 #!/usr/bin/env bash
 export PYTHONPATH="$APP/app\${PYTHONPATH:+:\$PYTHONPATH}"
+cd "$APP/app"  # python -m puts the current folder first: never run a stale source checkout by accident
 exec "$APP/venv/bin/python" -m deskbot "\$@"
 EOF
 chmod +x "$BIN/deskbot"
@@ -92,7 +93,7 @@ command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "$H
 
 say "5/6 Echo cancellation (use speakers without the bot hearing itself)"
 if command -v pipewire >/dev/null 2>&1; then
-  if ask "Enable PipeWire echo cancellation and make it your default mic? (audio restarts for a second)" Y; then
+  if ask "Enable PipeWire echo cancellation for DeskBot? (audio restarts for a second)" Y; then
     mkdir -p "$(dirname "$EC_CONF")"
     cat > "$EC_CONF" <<'EOF'
 # Added by DeskBot install.sh; removed by uninstall.sh.
@@ -112,8 +113,10 @@ context.modules = [
 EOF
     systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
     sleep 3
+    # Never make it the system default: on some setups it outputs pure silence, which mutes
+    # every app. DeskBot itself tests it and only uses it when it really passes sound.
     if command -v pactl >/dev/null 2>&1 && pactl list short sources 2>/dev/null | grep -q deskbot_ec_source; then
-      pactl set-default-source deskbot_ec_source && echo "Default mic is now 'Echo-cancelled mic (DeskBot)'."
+      echo "Echo-cancelled mic created. DeskBot will use it only if it passes sound."
     else
       echo "Echo-cancel source did not appear (your PipeWire may lack the WebRTC plugin)."
       echo "No harm done. Use headphones or raise 'Interrupt needs voice confidence' in Settings."
@@ -121,6 +124,12 @@ EOF
   fi
 else
   echo "PipeWire not found; skipping."
+fi
+
+# Older versions set the echo-cancel source as the system default mic: undo that.
+if command -v pactl >/dev/null 2>&1 && [[ "$(pactl get-default-source 2>/dev/null)" == deskbot_ec_source ]]; then
+  real=$(pactl list short sources 2>/dev/null | awk '{print $2}' | grep -v -e '\.monitor$' -e '^deskbot_' | head -1)
+  [[ -n "$real" ]] && pactl set-default-source "$real" && echo "Restored your system mic to: $real"
 fi
 
 say "6/6 Start automatically when you log in?"

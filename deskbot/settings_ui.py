@@ -11,11 +11,11 @@ import webbrowser
 from contextlib import redirect_stdout
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, Qt, QUrl, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QColor, QDesktopServices, QImage, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog,
                                QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
+                               QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSlider,
                                QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from . import llm
@@ -356,9 +356,30 @@ class SettingsDialog(QDialog):
 
     def _tab_hearing(self) -> QWidget:
         g, f = self._group("Microphone")
-        f.addRow("Microphone", self._combo("listen.input_device",
-                                           [("System default", "")] + [(d, d) for d in list_devices("input")],
+        if self.ctl.use_pulse:
+            from . import pulse_mic
+            mics = [("Auto: pick a mic that actually hears sound", "")] + [
+                (s.description, s.name) for s in pulse_mic.list_sources() if not s.monitor]
+        else:
+            mics = [("System default", "")] + [(d, d) for d in list_devices("input")]
+        f.addRow("Microphone", self._combo("listen.input_device", mics,
                                            on_change=lambda _v: self.ctl.restart_audio()))
+        meter = QProgressBar()
+        meter.setRange(0, 100)
+        meter.setTextVisible(False)
+        meter.setFixedHeight(12)
+        meter.setToolTip("Live mic level: it should jump when you talk")
+        using = QLabel()
+        using.setStyleSheet("color:#888")
+
+        def tick():
+            meter.setValue(min(100, int(self.ctl.mic_level * 600)))
+            using.setText(f"Listening on: {self.ctl.mic_name or 'system default'}")
+        self._meter_timer = QTimer(self, interval=80)
+        self._meter_timer.timeout.connect(tick)
+        self._meter_timer.start()
+        f.addRow("Mic level (talk!)", meter)
+        f.addRow("", using)
         f.addRow("Speaker", self._combo("listen.output_device",
                                         [("System default", "")] + [(d, d) for d in list_devices("output")],
                                         on_change=lambda _v: self.ctl.restart_audio()))
@@ -507,9 +528,28 @@ class SettingsDialog(QDialog):
 
     def _test_hearing(self) -> None:
         self._info("Test hearing", "Click OK, then speak for 4 seconds.")
-        self.ctl.record(4.0, lambda pcm: run_async(
-            lambda: llm.transcribe(self.cfg, pcm),
-            lambda res, err: self._error("Hearing", err) if err else self._info("I heard", res or "(nothing)")))
+
+        def got(pcm):
+            peak = float(abs(pcm.astype("int32")).max()) / 32768 if len(pcm) else 0.0
+            mic = self.ctl.mic_name or "the system default mic"
+            if len(pcm) == 0:
+                return self._info("Test hearing", "No audio arrived from the microphone at all. "
+                                  "Pick another mic above.")
+            if peak < 0.002:
+                return self._info("Test hearing", f"I only got silence from {mic} (peak {peak:.4f}).\n"
+                                  "Check the mute switch and input volume in GNOME Settings → Sound, "
+                                  "or pick another mic above.")
+
+            def done(res, err):
+                if err:
+                    return self._error("Hearing", err)
+                from .text_utils import is_hallucination
+                heard = res or ""
+                if is_hallucination(heard):
+                    heard = f"(only noise, Whisper guessed: {heard!r})"
+                self._info("I heard", f"Mic: {mic}\nLoudness: {int(min(1, peak) * 100)}%\n\n{heard}")
+            run_async(lambda: llm.transcribe(self.cfg, pcm), done)
+        self.ctl.record(4.0, got)
 
     def _load_voices(self) -> None:
         from .tts import edge_voices
