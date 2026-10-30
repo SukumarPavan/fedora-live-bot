@@ -74,6 +74,13 @@ def default_source() -> str:
         return ""
 
 
+def describe(name: str) -> str:
+    for s in list_sources():
+        if s.name == name:
+            return s.description
+    return name
+
+
 def set_default_source(name: str) -> bool:
     try:
         return subprocess.run(["pactl", "set-default-source", name], capture_output=True,
@@ -157,8 +164,9 @@ def choose_source(preferred: str = "") -> tuple[str, list[str], str]:
 class PulseMic:
     """Same interface as audio_io.Mic: on_block gets int16 blocks of MIC_BLOCK samples."""
 
-    def __init__(self, on_block: Callable[[np.ndarray], None]):
+    def __init__(self, on_block: Callable[[np.ndarray], None], on_dead: Callable[[str], None] | None = None):
         self.on_block = on_block
+        self.on_dead = on_dead
         self.proc: subprocess.Popen | None = None
         self.device = ""
         self._stop = threading.Event()
@@ -185,6 +193,8 @@ class PulseMic:
         if not self._stop.is_set():
             err = proc.stderr.read().decode(errors="replace")[-300:] if proc.stderr else ""
             log.error("Mic recorder stopped: %s", err.strip())
+            if self.on_dead:
+                self.on_dead(err.strip() or "recorder exited")
 
     def stop(self) -> None:
         self._stop.set()

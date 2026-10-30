@@ -10,6 +10,7 @@ import numpy as np
 
 from . import llm
 from .config import EMOTIONS
+from .echo_guard import EchoGuard, sounds_like_echo
 from .engine_common import EngineContext
 from .text_utils import (is_hallucination, mentions_name, pop_leading_tag, split_sentences,
                          strip_tags, tag_pending)
@@ -34,6 +35,7 @@ PROACTIVE_PROMPT = (
     "short sentence. Otherwise reply with exactly [skip].")
 
 FOLLOW_UP_WINDOW_S = 20.0
+TURN_DEADLINE_S = 20.0   # from end of your speech to the first word of the reply
 
 
 class UniversalEngine:
@@ -44,6 +46,10 @@ class UniversalEngine:
         self.player = ctx.player
         self.q: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=400)
         self.ep = Endpointer(make_vad(), self._vad_params())
+        self.guard = EchoGuard(self.player, float(self.cfg.get("listen.echo_margin", 2.5)))
+        self.recent_speech: list[tuple[float, str]] = []   # what the bot said lately (echo check)
+        self.turn_t = 0.0
+        self.turn_proactive = False
         self.tts = TTS(self.cfg)
         self.history: list[dict] = []
         self.gen = 0
@@ -88,6 +94,7 @@ class UniversalEngine:
 
     def settings_changed(self) -> None:
         self.ep.p = self._vad_params()
+        self.guard.margin = float(self.cfg.get("listen.echo_margin", 2.5))
 
     def interrupt(self) -> None:
         if self.busy and not self.reply_started:
@@ -103,18 +110,42 @@ class UniversalEngine:
 
     # --- loops ---------------------------------------------------------------------
     async def run(self) -> None:
-        await asyncio.gather(self._mic_loop(), self._proactive_loop())
+        missing = [p for p in {self.cfg.get("brain.provider"), self.cfg.get("ears.provider")}
+                   if not self.cfg.key(p)]
+        if missing:
+            self._status("error", f"No API key for {', '.join(missing)} (Settings → Brain)")
+        else:
+            self._status("ok", "Ready")
+        await asyncio.gather(self._mic_loop(), self._proactive_loop(), self._watchdog())
+
+    def _status(self, level: str, text: str) -> None:
+        self.bridge.status.emit("engine", level, text)
+
+    async def _watchdog(self) -> None:
+        """Never sit 'thinking' forever: give up loudly after TURN_DEADLINE_S."""
+        while True:
+            await asyncio.sleep(1.0)
+            if self.busy and not self.reply_started and self.turn_t and \
+                    time.monotonic() - self.turn_t > TURN_DEADLINE_S:
+                log.warning("No reply within %.0f s; giving up on this turn", TURN_DEADLINE_S)
+                quiet = self.turn_proactive
+                self.cur_text, self.cur_audio = "", None
+                self.interrupt()
+                self.turn_t = 0.0
+                if not quiet:
+                    self._fail("Sorry, I couldn't get an answer in time. The AI service is slow or busy. "
+                               "Try again, or pick another model in Settings → Brain.")
 
     async def _mic_loop(self) -> None:
         g = self.cfg.get
         while True:
             block = await self.q.get()
-            speaking = self.player.active
+            speaking = self.guard.bot_audible()
             if speaking and (g("listen.half_duplex") or not g("listen.barge_in")):
                 continue
             if g("listen.mode") == "push" and not self.ptt_armed:
                 continue
-            for kind, audio in self.ep.feed(block, bot_speaking=speaking):
+            for kind, audio in self.ep.feed(block, bot_speaking=speaking, gate=self.guard.is_user):
                 if kind == "start":
                     log.info("Speech started (voice probability %.2f)", self.ep.last_prob)
                     self.last_activity = time.monotonic()
@@ -141,6 +172,7 @@ class UniversalEngine:
             self.carry_audio = None
         self.busy = True
         self.reply_started = False
+        self.turn_t, self.turn_proactive = time.monotonic(), False
         self.cur_audio, self.cur_text = audio, ""
         gen = self.gen
         self.bridge.state.emit("thinking")
@@ -161,6 +193,12 @@ class UniversalEngine:
         if not text:
             self._idle()
             return
+        now = time.monotonic()
+        self.recent_speech = [(t, x) for t, x in self.recent_speech if now - t < 30]
+        if sounds_like_echo(text, [x for _, x in self.recent_speech]):
+            log.info("Ignored my own voice coming back through the mic: %r", text)
+            self._idle()
+            return
         self.cur_text = text
         if self.cfg.get("listen.mode") == "name" and \
                 time.monotonic() - self.last_reply > FOLLOW_UP_WINDOW_S and \
@@ -173,6 +211,8 @@ class UniversalEngine:
 
     async def _respond_new(self, text: str) -> None:
         self.busy = True
+        self.reply_started = False
+        self.turn_t, self.turn_proactive = time.monotonic(), False
         await self._respond(text, self.gen)
 
     def _images(self) -> list[tuple[str, bytes]]:
@@ -266,7 +306,9 @@ class UniversalEngine:
                 self.history.append({"role": "user", "content": "(check-in)" + note})
             self.history.append({"role": "assistant", "content": reply})
             self.bridge.bot_text.emit(reply, True)
+            self.recent_speech.append((time.monotonic(), reply))
             log.info("Replied: %r", reply[:200])
+            self._status("ok", "Ready")
             vision_note = llm.vision_note(self.cfg)
             if vision_note and images:
                 self.bridge.notice.emit(vision_note)
@@ -294,11 +336,13 @@ class UniversalEngine:
 
     def _idle(self) -> None:
         self.busy = False
+        self.turn_t = 0.0
         self.bridge.state.emit("idle")
 
     def _fail(self, msg: str, keep_speaking: bool = False) -> None:
         log.warning("Engine error: %s", msg)
         self.bridge.notice.emit(msg)
+        self._status("error", msg)
         self.bridge.emotion.emit("error", 3.0)
         if not keep_speaking:
             self._idle()
@@ -333,4 +377,6 @@ class UniversalEngine:
             log.info("Proactive check (change %.3f)", score)
             self.seen_gray = gray
             self.last_proactive = now
+            self.reply_started = False
+            self.turn_t, self.turn_proactive = time.monotonic(), True
             self.task = asyncio.ensure_future(self._respond(PROACTIVE_PROMPT, self.gen, proactive=True))

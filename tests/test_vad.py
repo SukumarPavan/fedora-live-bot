@@ -57,3 +57,24 @@ def test_jpeg_splitter():
     sp = JpegStreamSplitter()
     assert sp.feed(b"junk" + a + b[:3]) == [a]
     assert sp.feed(b[3:]) == [b]
+
+
+def test_echo_guard_learns_and_needs_user_louder_than_echo():
+    import time as _t
+    from deskbot.echo_guard import EchoGuard, sounds_like_echo
+
+    class P:
+        active, out_rms, last_audio_t = True, 0.05, 0.0
+    g = EchoGuard(P())
+    t = np.arange(512) / 16000
+    echo = (np.sin(2 * np.pi * 200 * t) * 0.02 * 46340).astype(np.int16)    # rms ≈ 0.02
+    for _ in range(60):
+        g.is_user(echo, 0.2, 0.85)                       # learning while nobody talks
+    assert 0.3 < g.coupling < 0.5
+    assert not g.is_user(echo, 0.99, 0.85)               # speech-like echo is not the user
+    assert g.is_user(echo * 8, 0.99, 0.85)               # someone talking loudly is
+    P.active, P.last_audio_t = False, _t.monotonic()
+    assert g.bot_audible()                               # echo tail right after it stops
+    assert sounds_like_echo("why do linux users love the terminal",
+                            ["Why do Linux users love terminal windows? Because GUI feelings."])
+    assert not sounds_like_echo("what is the weather today", ["Why do Linux users love terminals?"])

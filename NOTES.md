@@ -6,7 +6,13 @@
 - Edge TTS host is blocked in the sandbox, so voices were never heard here.
 - Windows 11 path: written, never run.
 
+## Visibility (2026-10-31: "is it working or not?")
+- A status pill under the bot always shows Listening / Thinking / Speaking / Live connected / the current error. Click it to open Settings → Check, which has a Test button for mic, hearing, brain, voice, Live, screen and camera.
+- Never silent: Universal gives up after 20 s with a message. Live warns if it heard you but sent no reply within 12 s. Live connect has a 15 s timeout. Reconnects show "Live reconnecting in N s" instead of spamming bubbles.
+- Brain first-word timeout is 8 s per model. API clients are reused per event loop, saving a TLS handshake per call.
+
 ## Platform (GNOME Wayland)
+- Screen share: the D-Bus flow is verified against a fake portal (tests/test_portal_fake.py). The user's earlier timeout matches "GNOME's dialog not answered". The pill now says "Pick a screen in GNOME's dialog", Start waits 90 s, and switching off mid-dialog no longer crashes (old bug: `self.session` was None after a stop() race).
 - Native Wayland apps cannot set their own position or stay on top. The bot runs under XWayland (`QT_QPA_PLATFORM=xcb`) as an override-redirect overlay. It also floats above fullscreen apps; use "Hide for 10 minutes".
 - Qt 6.5+ xcb plugin needs `xcb-util-cursor`, or the app will not start.
 - On Wayland, apps cannot read the global mouse position. Eyes follow the cursor only while it is over X11 windows (the bot itself); otherwise the bot glances randomly.
@@ -17,6 +23,9 @@
 - Laptop IPU6/MIPI webcams often are not V4L2-compatible, so OpenCV can't open them.
 
 ## Audio
+- **Speakers + internal mic, no echo cancel (the user's setup):** the bot heard its own voice. It cut itself off (a VAD can't tell its voice from yours) and answered its own words. Fixed by the echo guard: while the bot is audible, plus 0.8 s of tail, a block counts as you only if speech is likely AND the mic is `echo_margin`× louder than the learned echo level. Transcripts made mostly of the bot's recent words are dropped.
+- The silent-mic alarm only fires if the mic never had sound since it started, and only on 2 checks in a row. Noise-gated headsets send exact zeros when quiet. The first alarm triggers one automatic mic re-check.
+- If the `parecord` recorder dies, the mic restarts automatically (up to 3×/min), then says so.
 - **Real bug on the user's Fedora (2026-10-31):** install.sh made the PipeWire echo-cancel source the SYSTEM default mic, and it delivered pure digital silence. The bot never heard anything, and Test hearing sent silence to Whisper, which made up words. Fixed: never set it as default. The installer and the app restore a real default. On Linux the mic is recorded with `parecord` from a named PipeWire source. "Auto" probes each source and picks one with sound (peak ≥ 1e-4). Settings has a live mic meter, and Test hearing refuses to transcribe silence.
 - The launcher `cd`s into the installed app: `python -m deskbot` run inside a repo checkout otherwise imports the checkout, not the installed copy.
 - If no speaker opens, `Player.play` drops audio. Before, it set `active=True` forever and the engine hung after its first reply.

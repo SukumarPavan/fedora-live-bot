@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication, QMenu
 
 from . import pulse_mic
 from .audio_io import AUDIO_ERROR, Mic, Player
-from .bot_window import BotWindow, Bubble, ToolBar
+from .bot_window import BotWindow, Bubble, StatusPill, ToolBar
 from .bridge import Bridge
 from .chat_window import ChatWindow
 from .config import APP_ID, Settings
@@ -28,8 +28,12 @@ from .vision import Camera, Screen
 log = logging.getLogger(__name__)
 
 
+ACTIVITY = {"listening": "Listening…", "thinking": "Thinking…", "speaking": "Speaking…"}
+
+
 class Controller(QObject):
     _recorded = Signal(object, object)
+    _mic_died = Signal(str)
 
     def __init__(self, app: QApplication, cfg: Settings):
         super().__init__()
@@ -41,11 +45,17 @@ class Controller(QObject):
         self.player.gain = float(cfg.get("voice.volume", 100)) / 100
         # Linux: record straight from PipeWire so a bad system default can't silence the bot
         self.use_pulse = pulse_mic.available()
-        self.mic = pulse_mic.PulseMic(self._on_mic_block) if self.use_pulse else Mic(self._on_mic_block)
+        self.mic = pulse_mic.PulseMic(self._on_mic_block, self._mic_died.emit) if self.use_pulse \
+            else Mic(self._on_mic_block)
+        self._mic_restarts: list[float] = []
+        self._reprobed = False
+        self._mic_ever_heard = False   # a mic that had sound once is fine even if a noise gate zeroes it
+        self._silent_checks = 0
         self.mic_name = ""
         self._mic_lock = threading.Lock()
         self._taps: list[list] = []
-        self.screen = Screen(cfg, lambda m: self.bridge.eyes_failed.emit("screen:" + m))
+        self.screen = Screen(cfg, lambda m: self.bridge.eyes_failed.emit("screen:" + m),
+                             lambda level, text: self.bridge.status.emit("screen", level, text))
         self.camera = Camera(lambda m: self.bridge.eyes_failed.emit("cam:" + m))
         self.screen_on = False
         self.cam_on = False
@@ -54,13 +64,16 @@ class Controller(QObject):
                              lambda: self.mic_level if self.cfg.get("listen.mic_on", True) else 0.0)
         self.toolbar = ToolBar(cfg)
         self.bubble = Bubble(cfg)
+        self.pill = StatusPill(cfg)
+        self.parts: dict[str, tuple[str, str]] = {}
+        self._pill_timer = QTimer(self, interval=120)
+        self._pill_timer.timeout.connect(self._tick_pill)
         self.chat: ChatWindow | None = None
         self.settings_dlg: SettingsDialog | None = None
         self.state = "idle"
         self.last_activity = time.monotonic()
         self.sleeping = False
         self._pending_user = ""
-        self._listening_hint = False
         self._hovering = {"bot": False, "bar": False}
 
         self._hide_bar = QTimer(self, singleShot=True, interval=1300)
@@ -69,7 +82,7 @@ class Controller(QObject):
         self.mic_peak = 0.0
         self.mic_blocks = 0
         self._mic_warned = False
-        self._mic_check = QTimer(self, interval=20000)
+        self._mic_check = QTimer(self, interval=8000)
         self._mic_check.timeout.connect(self._check_mic)
         self._sleep_timer = QTimer(self, interval=5000)
         self._sleep_timer.timeout.connect(self._check_sleep)
@@ -82,6 +95,9 @@ class Controller(QObject):
         b.bot_text.connect(self._on_bot_text)
         b.notice.connect(self._on_notice)
         b.eyes_failed.connect(self._on_eyes_failed)
+        b.status.connect(self._on_status)
+        self._mic_died.connect(self._on_mic_died)
+        self.pill.clicked.connect(lambda: self.open_settings(check=True))
 
         self.bot.clicked.connect(self._on_click)
         self.bot.double_clicked.connect(self.open_chat)
@@ -99,6 +115,7 @@ class Controller(QObject):
         self.restart_engine()
         self._sleep_timer.start()
         self._mic_check.start()
+        self._pill_timer.start()
         QTimer.singleShot(600, self._greet)
 
     def _greet(self) -> None:
@@ -137,15 +154,27 @@ class Controller(QObject):
                 self.player.start(self.cfg.get("listen.output_device", ""))
             except Exception as e:
                 self._on_notice(f"Speaker problem: {e}")
+        self.restart_mic()
+
+    def restart_mic(self) -> None:
+        self._mic_warned = False
+        self._mic_ever_heard = False
+        self._silent_checks = 0
+        self.mic_blocks, self.mic_peak = 0, 0.0
         if self.use_pulse:
             # probing takes a second or two per mic: keep the UI responsive
+            self.bridge.status.emit("mic", "busy", "Checking microphones…")
             threading.Thread(target=self._start_pulse_mic, daemon=True, name="mic-probe").start()
             return
         if AUDIO_ERROR:
+            self.bridge.status.emit("mic", "error", "No audio system (PortAudio missing)")
             return
         try:
             self.mic.start(self.cfg.get("listen.input_device", ""))
+            self.mic_name = self.cfg.get("listen.input_device", "") or "system default"
+            self.bridge.status.emit("mic", "ok", f"Mic: {self.mic_name}")
         except Exception as e:
+            self.bridge.status.emit("mic", "error", "Microphone won't open")
             self._on_notice(f"Microphone problem: {e}")
 
     def _start_pulse_mic(self) -> None:  # background thread
@@ -155,16 +184,30 @@ class Controller(QObject):
             for line in report:
                 log.info("Mic check: %s", line)
             if not name:
+                self.bridge.status.emit("mic", "error", "No microphone found")
                 self.bridge.notice.emit("I can't find any microphone. Plug one in, then Settings → Hearing.")
                 return
             try:
                 self.mic.start(name)
-                self.mic_name = name
+                self.mic_name = pulse_mic.describe(name)
             except Exception as e:
+                self.bridge.status.emit("mic", "error", "Microphone won't open")
                 self.bridge.notice.emit(f"Microphone problem: {e}")
                 return
+            self.bridge.status.emit("mic", "ok", f"Mic: {self.mic_name}")
             if notice:
                 self.bridge.notice.emit(notice)
+
+    def _on_mic_died(self, err: str) -> None:
+        now = time.monotonic()
+        self._mic_restarts = [t for t in self._mic_restarts if now - t < 60] + [now]
+        if len(self._mic_restarts) <= 3:
+            self.bridge.status.emit("mic", "warn", "Mic stopped, reconnecting…")
+            QTimer.singleShot(1500, self.restart_mic)
+        else:
+            self.bridge.status.emit("mic", "error", "Mic keeps failing")
+            self._on_notice(f"My microphone keeps disconnecting ({err[:80]}). Pick another one in "
+                            "Settings → Hearing.")
 
     def _on_mic_block(self, block: np.ndarray) -> None:  # audio thread
         for tap in list(self._taps):
@@ -178,21 +221,35 @@ class Controller(QObject):
             self.host.call(eng.on_mic_block, block)
 
     def _check_mic(self) -> None:
-        """Every 20 s: warn once if the microphone delivers nothing or pure silence."""
+        """Every 8 s: notice a mic that delivers nothing or pure silence, re-pick once, then warn."""
         blocks, peak = self.mic_blocks, self.mic_peak
         self.mic_blocks, self.mic_peak = 0, 0.0
-        if not self.cfg.get("listen.mic_on", True) or AUDIO_ERROR or self._mic_warned:
+        if not self.cfg.get("listen.mic_on", True) or self._mic_warned:
             return
+        if self.parts.get("mic", ("",))[0] == "busy":
+            return  # still probing
+        if peak >= 0.002:
+            self._mic_ever_heard = True
         if blocks == 0:
             msg = "My microphone isn't sending any sound. Pick another mic in Settings → Hearing."
-        elif peak < 0.0005:
+        elif peak < 0.0002 and not self._mic_ever_heard:
             msg = ("My microphone is completely silent. Is it muted, or is the wrong mic selected? "
                    "Settings → Hearing → Test hearing.")
         else:
-            log.info("Mic OK: %d blocks, peak level %.4f in the last 20 s", blocks, peak)
+            self._silent_checks = 0
+            log.debug("Mic OK: %d blocks, peak level %.4f", blocks, peak)
+            return
+        self._silent_checks += 1
+        if self._silent_checks < 2:
             return
         log.warning(msg)
+        if self.use_pulse and not self.cfg.get("listen.input_device") and not self._reprobed:
+            self._reprobed = True  # maybe the system switched devices: look again, once
+            log.info("Re-checking microphones")
+            self.restart_mic()
+            return
         self._mic_warned = True
+        self.bridge.status.emit("mic", "error", "Mic is silent")
         self._on_notice(msg)
 
     def record(self, seconds: float, cb) -> None:
@@ -227,6 +284,7 @@ class Controller(QObject):
             from .engine_universal import UniversalEngine
             engine = UniversalEngine(ctx)
         self.player.clear()
+        self.parts.pop("engine", None)
         self.host.start(engine)
         self._sync_indicators()
         log.info("Engine started: %s", mode)
@@ -242,9 +300,11 @@ class Controller(QObject):
         self.screen_on = on
         if on:
             self.screen.start()
-            self.bubble.show_text(bot="Screen sight on. I can see your screen now.", user="")
+            if self.screen.backend() != "portal":
+                self.bubble.show_text(bot="Screen sight on. I can see your screen now.", user="")
         else:
             self.screen.stop()
+            self.bridge.status.emit("screen", "off", "")
         self._sync_indicators()
 
     def set_cam(self, on: bool) -> None:
@@ -282,9 +342,11 @@ class Controller(QObject):
         if kind == "screen":
             self.screen_on = False
             self.screen.stop()
+            self.bridge.status.emit("screen", "off", "")
         else:
             self.cam_on = False
             self.camera.stop()
+            self.bridge.status.emit("cam", "off", "")
         self._sync_indicators()
         self._on_notice(msg)
 
@@ -305,18 +367,47 @@ class Controller(QObject):
         self.bot.talking = s != "idle"
         if s != "idle":
             self._wake()
-        if s == "listening" and not self.bubble.isVisible():
-            self._listening_hint = True
-            self.bubble.show_text(user="", bot="(listening…)", final=False)
-            self._follow()
-        elif s == "idle" and self._listening_hint:
-            self.bubble.clear()
-        if s != "listening":
-            self._listening_hint = False
+        self._tick_pill()
         if s == "thinking":
             f.set_emotion("thinking")
         elif f.base_emotion == "thinking":
             f.set_emotion("neutral")
+
+    def _on_status(self, part: str, level: str, text: str) -> None:
+        log.info("Status %s: %s %s", part, level, text)
+        if level == "off":
+            self.parts.pop(part, None)
+        else:
+            self.parts[part] = (level, text)
+        self._tick_pill()
+
+    def _tick_pill(self) -> None:
+        if not self.cfg.get("bot.status_pill", True) or not self.bot.isVisible():
+            self.pill.hide()
+            return
+        level, text = "ok", "Ready"
+        order = ("engine", "mic", "screen", "cam")
+        problem = next(((lvl, txt) for want in ("error", "warn") for part in order
+                        for lvl, txt in [self.parts.get(part, ("", ""))] if lvl == want), None)
+        busy = next((self.parts[p] for p in ("screen", "mic", "engine")
+                     if self.parts.get(p, ("",))[0] == "busy"), None)
+        if problem:
+            level, text = problem
+        elif self.state in ACTIVITY:
+            level, text = "busy", ACTIVITY[self.state]
+        elif busy:
+            level, text = busy
+        elif not self.cfg.get("listen.mic_on", True):
+            level, text = "off", "Mic off"
+        else:
+            eng = self.parts.get("engine", ("ok", "Ready"))[1]
+            text = eng if self.cfg.get("engine.mode") == "live" else f"{eng} · Universal"
+        self.pill.set_status(level, text)
+        self.pill.follow(self.bot)
+        if not self.pill.isVisible():
+            self.pill.show()
+        if level == "busy":
+            self.pill.update()
 
     def _on_emotion(self, name: str, hold: float) -> None:
         self._wake()
@@ -338,7 +429,6 @@ class Controller(QObject):
     # ----------------------------------------------------------------------------- text
     def _on_user_text(self, text: str) -> None:
         self._wake()
-        self._listening_hint = False
         self._pending_user = text
         self.bubble.show_text(user=text, bot="", final=False)
         self._follow()
@@ -368,6 +458,8 @@ class Controller(QObject):
             self.bubble.follow(self.bot)
         if self.toolbar.isVisible():
             self.toolbar.follow(self.bot)
+        if self.pill.isVisible():
+            self.pill.follow(self.bot)
 
     def _hover(self, who: str, on: bool) -> None:
         self._hovering[who] = on
@@ -403,6 +495,7 @@ class Controller(QObject):
         self.cfg.set("listen.mic_on", on)
         self.bubble.show_text(bot="I'm listening." if on else "Mic off. I won't listen.", user="")
         self._sync_indicators()
+        self._tick_pill()
 
     def set_engine(self, mode: str) -> None:
         self.cfg.set("engine.mode", mode)
@@ -449,9 +542,11 @@ class Controller(QObject):
             self.restart_engine()
         self._on_notice("Okay, I forgot our conversation.")
 
-    def open_settings(self) -> None:
+    def open_settings(self, check: bool = False) -> None:
         if self.settings_dlg is None:
             self.settings_dlg = SettingsDialog(self.cfg, self)
+        if check:
+            self.settings_dlg.show_check_tab()
         self.settings_dlg.show()
         self.settings_dlg.raise_()
         self.settings_dlg.activateWindow()
@@ -469,7 +564,7 @@ class Controller(QObject):
         self._follow()
 
     def hide_for(self, minutes: int) -> None:
-        for w in (self.bot, self.toolbar, self.bubble):
+        for w in (self.bot, self.toolbar, self.bubble, self.pill):
             w.hide()
         QTimer.singleShot(minutes * 60 * 1000, self.bot.show)
 

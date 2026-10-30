@@ -23,8 +23,39 @@ class ApiError(RuntimeError):
     """An error with a message that is safe and friendly to show to the user."""
 
 
+_clients: dict[tuple, openai.AsyncOpenAI] = {}
+
+
+class _Shared:
+    """Wraps a cached client so callers' `await client.close()` doesn't close it."""
+
+    def __init__(self, client: openai.AsyncOpenAI):
+        self._c = client
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    async def close(self) -> None:
+        pass
+
+
 def make_client(cfg: Settings, provider: str, timeout: float = 60.0,
                 max_retries: int = 1) -> openai.AsyncOpenAI:
+    try:
+        loop_id = id(asyncio.get_running_loop())
+    except RuntimeError:
+        loop_id = 0
+    k = (cfg.base_url(provider), cfg.key(provider), timeout, max_retries, loop_id)
+    if loop_id and k[0] and k[1]:
+        if k not in _clients:
+            if len(_clients) > 32:
+                _clients.clear()
+            _clients[k] = _new_client(cfg, provider, timeout, max_retries)
+        return _Shared(_clients[k])
+    return _new_client(cfg, provider, timeout, max_retries)
+
+
+def _new_client(cfg: Settings, provider: str, timeout: float, max_retries: int) -> openai.AsyncOpenAI:
     base = cfg.base_url(provider)
     key = cfg.key(provider)
     label = PROVIDERS.get(provider, {}).get("label", provider)
@@ -102,7 +133,7 @@ async def transcribe(cfg: Settings, pcm16: np.ndarray) -> str:
     return (getattr(res, "text", None) or str(res)).strip()
 
 
-FIRST_TOKEN_TIMEOUT = 12.0   # a model that hasn't started answering by now is skipped
+FIRST_TOKEN_TIMEOUT = 8.0    # a model that hasn't started answering by now is skipped
 BACKUP_ERRORS = (openai.RateLimitError, openai.InternalServerError, openai.NotFoundError,
                  openai.APITimeoutError, openai.APIConnectionError, asyncio.TimeoutError)
 

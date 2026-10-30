@@ -166,10 +166,12 @@ def session_type() -> str:
 class Screen:
     """Screen frames from the portal (Wayland), mss (X11/Windows) or a custom command."""
 
-    def __init__(self, cfg: Settings, on_error: Callable[[str], None]):
+    def __init__(self, cfg: Settings, on_error: Callable[[str], None],
+                 on_status: Callable[[str, str], None] = lambda level, text: None):
         self.cfg = cfg
         self.slot = FrameSlot()
         self.on_error = on_error
+        self.on_status = on_status
         self.portal = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -188,16 +190,26 @@ class Screen:
         g = self.cfg.get
         if b == "portal":
             from .portal import PortalCapture
-            self.portal = PortalCapture(self.slot.put, self._portal_error,
-                                        lambda tok: self.cfg.set("eyes.restore_token", tok))
+            def got_frame(jpeg: bytes) -> None:
+                if self.slot.jpeg is None:
+                    log.info("Screen sight: first frame received (%d KB)", len(jpeg) // 1024)
+                    self.on_status("ok", "Seeing your screen")
+                self.slot.put(jpeg)
+            portal = PortalCapture(got_frame, self._portal_error,
+                                   lambda tok: self.cfg.set("eyes.restore_token", tok))
+            self.portal = portal
             # the portal dialog can block for a while: do it off the UI thread
             def go():
                 try:
-                    self.portal.start(g("eyes.restore_token", ""), g("eyes.gst_template"),
-                                      g("eyes.screen_max_width"), g("eyes.screen_fps"), g("eyes.jpeg_quality"))
+                    self.on_status("busy", "Starting screen sight…")
+                    portal.start(g("eyes.restore_token", ""), g("eyes.gst_template"),
+                                      g("eyes.screen_max_width"), g("eyes.screen_fps"), g("eyes.jpeg_quality"),
+                                      on_wait=lambda: self.on_status(
+                                          "busy", "Pick a screen in GNOME's dialog"))
                 except Exception as e:
-                    log.exception("portal start failed")
-                    self.on_error(str(e))
+                    log.warning("Screen sight failed to start: %s", e)
+                    if not self._stop.is_set():
+                        self.on_error(str(e))
             threading.Thread(target=go, daemon=True, name="portal-start").start()
         else:
             self._thread = threading.Thread(target=self._poll, args=(b,), daemon=True, name="screen")

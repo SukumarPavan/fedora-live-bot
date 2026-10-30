@@ -21,7 +21,7 @@ class Sig:
 class FakeBridge:
     def __init__(self):
         self.log = []
-        for n in ("state", "emotion", "user_text", "bot_text", "notice", "eyes_failed"):
+        for n in ("state", "emotion", "user_text", "bot_text", "notice", "eyes_failed", "status"):
             setattr(self, n, Sig(self.log, n))
 
 
@@ -30,6 +30,8 @@ class FakePlayer:
         self.played = []
         self.active = False
         self.cleared = 0
+        self.out_rms = 0.0
+        self.last_audio_t = 0.0
 
     def play(self, pcm):
         self.played.append(pcm)

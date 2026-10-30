@@ -9,3 +9,4 @@ class Bridge(QObject):
     bot_text = Signal(str, bool)   # what the bot is saying, final?
     notice = Signal(str)           # errors and info for the bubble and chat log
     eyes_failed = Signal(str)      # "screen" or "cam" failed and was switched off
+    status = Signal(str, str, str)  # part (engine|mic|screen|cam), level (ok|busy|warn|error|off), text

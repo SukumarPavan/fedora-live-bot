@@ -69,22 +69,27 @@ async def test_receive_audio_transcripts_and_interrupt(tmp_path):
     assert ("emotion", ("happy", 8.0)) in bridge.log
 
 
+def tone(level):
+    t = np.arange(512) / 16000
+    return (np.sin(2 * np.pi * 220 * t) * level * 32767 * 1.414).astype(np.int16)
+
+
 @pytest.mark.asyncio
 async def test_barge_gate_blocks_echo_but_passes_real_speech(tmp_path):
     eng, bridge, player, cfg = make(tmp_path)
     probs = []
     eng.vad = lambda block: probs.pop(0)
     session = FakeSession([])
-    player.active = True                          # bot is talking
+    player.active, player.out_rms = True, 0.05          # bot is talking
     task = asyncio.ensure_future(eng._send_audio(session))
-    for _ in range(15):                           # echo: medium probability
-        probs.append(0.6)
-        eng.on_mic_block(np.zeros(512, dtype=np.int16))
+    for _ in range(30):                                  # its echo, even when it sounds like speech
+        probs.append(0.95)
+        eng.on_mic_block(tone(0.03))
     await asyncio.sleep(0.1)
     assert session.sent == [] and player.cleared == 0
-    for _ in range(12):                           # the user really talks
+    for _ in range(12):                                  # the user really talks over it
         probs.append(0.97)
-        eng.on_mic_block(np.zeros(512, dtype=np.int16))
+        eng.on_mic_block(tone(0.3))
     await asyncio.sleep(0.1)
     task.cancel()
     assert player.cleared >= 1 and session.sent

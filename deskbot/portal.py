@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 BUS = "org.freedesktop.portal.Desktop"
 PATH = "/org/freedesktop/portal/desktop"
 IFACE = "org.freedesktop.portal.ScreenCast"
+START_TIMEOUT_S = 90.0  # how long you get to pick a screen in GNOME's dialog
 
 
 class PortalError(RuntimeError):
@@ -51,7 +52,7 @@ class PortalSession:
         except Exception:
             return 0
 
-    def _request(self, method: str, signature: str, args: tuple, token: str, timeout: float = 180):
+    def _request(self, method: str, signature: str, args: tuple, token: str, timeout: float = 20):
         from jeepney import MatchRule, new_method_call
         from jeepney.bus_messages import message_bus
         from jeepney.io.blocking import Proxy
@@ -64,7 +65,15 @@ class PortalSession:
             reply = self.conn.send_and_get_reply(new_method_call(self.addr, method, signature, args),
                                                  timeout=30)
             unwrap_msg(reply)
-            msg = self.conn.recv_until_filtered(queue, timeout=timeout)
+            log.info("Portal: %s sent, waiting up to %.0f s for the answer", method, timeout)
+            try:
+                msg = self.conn.recv_until_filtered(queue, timeout=timeout)
+            except TimeoutError:
+                if method == "Start":
+                    raise PortalError("You didn't pick a screen in GNOME's sharing dialog in time. "
+                                      "Turn Screen sight on again to retry.") from None
+                raise PortalError(f"GNOME's screen-sharing service didn't answer ({method}). "
+                                  "Try again, or log out and back in.") from None
         code, results = msg.body
         if code == 1:
             raise PortalError("Screen sharing was cancelled.")
@@ -72,8 +81,10 @@ class PortalSession:
             raise PortalError(f"Screen sharing failed (portal code {code}).")
         return results
 
-    def start(self, restore_token: str = "") -> tuple[int, int, str]:
-        """Returns (pipewire_node_id, pipewire_fd, new_restore_token)."""
+    def start(self, restore_token: str = "", on_wait=None) -> tuple[int, int, str]:
+        """Returns (pipewire_node_id, pipewire_fd, new_restore_token).
+
+        on_wait() is called right before GNOME may show its screen picker."""
         from jeepney import new_method_call
         from jeepney.wrappers import unwrap_msg
         version = self._version()
@@ -95,11 +106,16 @@ class PortalSession:
         self._request("SelectSources", "oa{sv}", (self.session, opts), t2)
 
         t3 = "deskbot" + secrets.token_hex(4)
-        res = self._request("Start", "osa{sv}", (self.session, "", {"handle_token": ("s", t3)}), t3)
+        if on_wait:
+            on_wait()
+        res = self._request("Start", "osa{sv}", (self.session, "", {"handle_token": ("s", t3)}), t3,
+                            timeout=START_TIMEOUT_S)
         streams = res.get("streams", (None, []))[1]
         if not streams:
             raise PortalError("No screen was selected.")
         node_id = int(streams[0][0])
+        log.info("Portal: sharing PipeWire node %s (restore token %s)", node_id, "saved" if
+                 res.get("restore_token") else "not offered")
         new_token = res.get("restore_token", ("s", ""))[1]
 
         reply = self.conn.send_and_get_reply(
@@ -156,18 +172,26 @@ class PortalCapture:
         self.proc: subprocess.Popen | None = None
         self._stop = threading.Event()
 
-    def start(self, restore_token: str, template: str, width: int, fps: float, quality: int) -> None:
+    def start(self, restore_token: str, template: str, width: int, fps: float, quality: int,
+              on_wait=None) -> None:
         if not shutil.which("gst-launch-1.0"):
             raise PortalError("gst-launch-1.0 missing. Run: sudo dnf install gstreamer1 pipewire-gstreamer "
                               "gstreamer1-plugins-good")
         self._stop.clear()
-        self.session = PortalSession()
+        session = PortalSession()
+        self.session = session
         try:
-            node, fd, token = self.session.start(restore_token)
+            node, fd, token = session.start(restore_token, on_wait)
         except Exception:
-            self.session.close()
-            self.session = None
+            session.close()  # local ref: stop() may have cleared self.session meanwhile
+            if self.session is session:
+                self.session = None
             raise
+        if self._stop.is_set():  # switched off while GNOME's dialog was open
+            import os
+            os.close(fd)
+            session.close()
+            return
         if token:
             self.save_token(token)
         pipeline = template.format(fd=fd, node=node, width=int(width), quality=int(quality),

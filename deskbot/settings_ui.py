@@ -7,6 +7,7 @@ import asyncio
 import io
 import logging
 import threading
+import time
 import webbrowser
 from contextlib import redirect_stdout
 from typing import Any, Callable
@@ -71,10 +72,11 @@ class SettingsDialog(QDialog):
         self.cfg = cfg
         self.ctl = ctl
         self.setWindowTitle("DeskBot Settings")
-        self.resize(640, 720)
+        self.resize(780, 740)
         self._combos: dict[str, QComboBox] = {}
         tabs = QTabWidget()
-        for title, builder in [("Bot", self._tab_bot), ("Look && Move", self._tab_look),
+        self.tabs = tabs
+        for title, builder in [("Check", self._tab_check), ("Bot", self._tab_bot), ("Look && Move", self._tab_look),
                                ("Brain (AI)", self._tab_brain), ("Hearing", self._tab_hearing),
                                ("Voice", self._tab_voice), ("Live mode", self._tab_live),
                                ("Eyes", self._tab_eyes), ("Advanced", self._tab_advanced)]:
@@ -236,6 +238,188 @@ class SettingsDialog(QDialog):
         QMessageBox.warning(self, title, str(err))
 
     # -------------------------------------------------------------------------- tabs
+    def show_check_tab(self) -> None:
+        self.tabs.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------ Check tab
+    def _result(self, key: str, ok: bool | None, text: str) -> None:
+        lab = self._results[key]
+        mark, color = {True: ("✔", "#2e9d4f"), False: ("✘", "#d03b3b"), None: ("…", "#888")}[ok]
+        lab.setText(f"{mark} {text}")
+        lab.setStyleSheet(f"color:{color}")
+
+    def _tab_check(self) -> QWidget:
+        self._results: dict[str, QLabel] = {}
+        g, f = self._group("Is everything working? Click a Test button.")
+
+        def row(key: str, title: str, button: str, fn) -> None:
+            lab = QLabel("not tested yet")
+            lab.setWordWrap(True)
+            lab.setStyleSheet("color:#888")
+            self._results[key] = lab
+            f.addRow(f"<b>{title}</b>", self._hbox(lab, self._button(button, fn)))
+
+        meter = QProgressBar()
+        meter.setRange(0, 100)
+        meter.setTextVisible(False)
+        meter.setFixedHeight(12)
+        mic_lab = QLabel()
+        mic_lab.setStyleSheet("color:#888")
+
+        def tick():
+            meter.setValue(min(100, int(self.ctl.mic_level * 600)))
+            lvl, txt = self.ctl.parts.get("mic", ("", "starting…"))
+            mic_lab.setText(txt + ("" if self.cfg.get("listen.mic_on", True) else "  (mic is switched OFF)"))
+        self._check_timer = QTimer(self, interval=80)
+        self._check_timer.timeout.connect(tick)
+        self._check_timer.start()
+        f.addRow("<b>Microphone</b>", self._hbox(meter, self._button("Re-check mics", self.ctl.restart_mic)))
+        f.addRow("", mic_lab)
+        tip = QLabel("Talk: the bar must jump. If it doesn't, pick your mic on the Hearing tab.")
+        tip.setStyleSheet("color:#888")
+        f.addRow("", tip)
+        row("hearing", "Hearing", "Test (talk 4 s)", self._check_hearing)
+        row("brain", "Brain", "Test", self._check_brain)
+        row("voice", "Voice", "Test", self._check_voice)
+        row("live", "Gemini Live", "Test", self._check_live)
+        row("screen", "Screen sight", "Test", self._check_screen)
+        row("camera", "Camera", "Test", self._check_camera)
+        f.addRow(self._button("Run brain + voice + Live checks", self._check_all))
+        return self._page(g)
+
+    def _check_all(self) -> None:
+        self._check_brain(lambda: self._check_voice(lambda: self._check_live()))
+
+    def _check_hearing(self) -> None:
+        self._result("hearing", None, "Recording… talk now for 4 seconds")
+
+        def got(pcm):
+            peak = float(abs(pcm.astype("int32")).max()) / 32768 if len(pcm) else 0.0
+            if len(pcm) == 0:
+                return self._result("hearing", False, "No audio arrived from the mic. Pick another one (Hearing tab).")
+            if peak < 0.002:
+                return self._result("hearing", False, f"Only silence (peak {peak:.4f}). Mic muted or wrong mic.")
+            self._result("hearing", None, "Sending to speech-to-text…")
+            t0 = time.monotonic()
+
+            def done(res, err):
+                if err:
+                    return self._result("hearing", False, str(err))
+                from .text_utils import is_hallucination
+                if is_hallucination(res or ""):
+                    return self._result("hearing", False, f"Heard only noise (loudness {int(peak * 100)}%). "
+                                        "Speak closer or raise mic volume.")
+                self._result("hearing", True, f"Heard in {time.monotonic() - t0:.1f}s: “{res}”")
+            run_async(lambda: llm.transcribe(self.cfg, pcm), done)
+        self.ctl.record(4.0, got)
+
+    def _check_brain(self, then=None) -> None:
+        self._result("brain", None, "Asking the AI…")
+        msgs = [{"role": "system", "content": self.cfg.system_prompt()},
+                {"role": "user", "content": "Say hi in at most 8 words."}]
+
+        async def go():
+            t0 = time.monotonic()
+            return await llm.complete(self.cfg, msgs), time.monotonic() - t0
+
+        def done(res, err):
+            if err:
+                self._result("brain", False, str(err))
+            else:
+                text, secs = res
+                self._result("brain", True, f"{self.cfg.get('brain.model')} answered in {secs:.1f}s: “{text.strip()}”")
+            if then:
+                then()
+        run_async(go, done)
+
+    def _check_voice(self, then=None) -> None:
+        from .tts import TTS
+        self._result("voice", None, "Making speech…")
+        tts = TTS(self.cfg)
+
+        async def go():
+            t0 = time.monotonic()
+            pcm = await tts.synth("Voice check. Can you hear me?")
+            return pcm, time.monotonic() - t0
+
+        def done(res, err):
+            if err:
+                self._result("voice", False, str(err))
+            else:
+                pcm, secs = res
+                self.ctl.player.play(pcm)
+                fallback = "" if tts.used == self.cfg.get("voice.engine") else \
+                    f" (main voice failed, used {tts.used})"
+                ok = self.ctl.player.stream is not None
+                self._result("voice", ok, f"{tts.used} voice ready in {secs:.1f}s{fallback}. You should hear it now."
+                             if ok else "Speech was made but no speaker is open (Hearing tab → Speaker).")
+            if then:
+                then()
+        run_async(go, done)
+
+    def _check_live(self, then=None) -> None:
+        if not self.cfg.key("gemini"):
+            self._result("live", False, "No Gemini key (Brain tab).")
+            return then() if then else None
+        self._result("live", None, "Connecting to Gemini Live…")
+        from .engine_live import live_selftest
+
+        def done(res, err):
+            if err:
+                msg = str(err) or type(err).__name__
+                if isinstance(err, TimeoutError):
+                    msg = "Timed out: Gemini Live didn't answer in 30 s (busy or blocked)."
+                self._result("live", False, msg[:200])
+            elif res["pcm"] is None:
+                self._result("live", False, f"Connected to {res['model']} but it sent no audio.")
+            else:
+                self.ctl.player.play(res["pcm"])
+                self._result("live", True, f"{res['model']}: connected in {res['connect_s']:.1f}s, "
+                             f"spoke after {res['first_audio_s']:.1f}s: “{res['said']}”")
+            if then:
+                then()
+        run_async(lambda: live_selftest(self.cfg), done)
+
+    def _check_screen(self) -> None:
+        was_on = self.ctl.screen_on
+        self.ctl.set_screen(True)
+        self._result("screen", None, "Starting… if GNOME asks, pick a screen and click Share")
+        t0 = time.monotonic()
+
+        def poll():
+            jpeg = self.ctl.screen.slot.get()
+            if jpeg:
+                self._result("screen", True, f"Got a {len(jpeg) // 1024} KB frame in {time.monotonic() - t0:.0f}s."
+                             + ("" if was_on else " (Screen sight left ON; turn it off from the bot.)"))
+            elif not self.ctl.screen_on:
+                lvl, txt = self.ctl.parts.get("screen", ("", ""))
+                self._result("screen", False, txt or "Screen sight failed; see the bot's bubble.")
+            elif time.monotonic() - t0 > 100:
+                self._result("screen", False, "No frame after 100 s.")
+            else:
+                QTimer.singleShot(500, poll)
+        QTimer.singleShot(500, poll)
+
+    def _check_camera(self) -> None:
+        was_on = self.ctl.cam_on
+        self.ctl.set_cam(True)
+        self._result("camera", None, "Opening camera…")
+        t0 = time.monotonic()
+
+        def poll():
+            jpeg = self.ctl.camera.slot.get(max_age=5)
+            if jpeg:
+                self._result("camera", True, f"Got a picture in {time.monotonic() - t0:.1f}s.")
+                if not was_on:
+                    self.ctl.set_cam(False)
+            elif not self.ctl.cam_on or time.monotonic() - t0 > 8:
+                self._result("camera", False, "No picture. Try another camera number (Eyes tab).")
+                if self.ctl.cam_on and not was_on:
+                    self.ctl.set_cam(False)
+            else:
+                QTimer.singleShot(300, poll)
+        QTimer.singleShot(300, poll)
+
     def _tab_bot(self) -> QWidget:
         g, f = self._group("Identity")
         f.addRow("Name", self._line("bot.name"))
@@ -247,6 +431,7 @@ class SettingsDialog(QDialog):
             ("English + Hindi mix", "english_hindi"), ("Any language (auto)", "auto")]))
         g2, f2 = self._group("Subtitles and startup")
         f2.addRow(self._check("bot.subtitles", "Show speech bubble"))
+        f2.addRow(self._check("bot.status_pill", "Show status under the bot (Listening, Thinking, errors)"))
         f2.addRow("Bubble stays (s)", self._slider("bot.subtitle_seconds", 2, 20))
         f2.addRow(self._check("system.autostart", "Start when I log in", self.ctl.set_autostart))
         f2.addRow("Fall asleep after (min idle)", self._slider("system.sleep_after_min", 1, 60))
@@ -398,6 +583,8 @@ class SettingsDialog(QDialog):
         f2.addRow("Interrupt needs voice confidence", self._slider("listen.barge_threshold", 0.5, 0.99, 0.01,
                                                                    "{:.2f}", sc))
         f2.addRow("…for at least (ms)", self._slider("listen.barge_ms", 100, 1000, 20, "{:.0f}", sc))
+        f2.addRow("With speakers: be louder than its echo by", self._slider(
+            "listen.echo_margin", 1.2, 6.0, 0.1, "{:.1f}x", sc))
         f2.addRow(self._check("listen.half_duplex",
                               "Mute the mic while the bot talks (use if it keeps interrupting itself)"))
         g3, f3 = self._group("Speech-to-text (Universal mode)")

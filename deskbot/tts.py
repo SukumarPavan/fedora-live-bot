@@ -35,6 +35,7 @@ class TTS:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
         self.last_error = ""
+        self.used = ""  # engine that produced the last audio
         self.down_until: dict[str, float] = {}
 
     async def synth(self, text: str) -> np.ndarray:
@@ -53,6 +54,7 @@ class TTS:
                     if engine != order[0]:
                         log.warning("TTS used fallback %s", engine)
                     self.down_until.pop(engine, None)
+                    self.used = engine
                     return robotize(pcm, float(self.cfg.get("voice.robot_effect", 0.0)))
             except Exception as e:
                 errors.append(f"{engine}: {e}")

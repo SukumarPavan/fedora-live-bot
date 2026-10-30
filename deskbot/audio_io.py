@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import logging
 import threading
+import time
 from typing import Callable
 
 import numpy as np
@@ -126,6 +127,8 @@ class Player:
         self._rate = OUT_SR
         self.gain = 1.0
         self.level = 0.0          # smoothed loudness 0..1 for lip sync
+        self.out_rms = 0.0        # raw loudness of what is being played (echo estimation)
+        self.last_audio_t = 0.0   # monotonic time the last non-silent block was played
         self.active = False       # True while audio is queued or playing
         self.idle_event = threading.Event()
         self.idle_event.set()
@@ -188,6 +191,9 @@ class Player:
                 self.idle_event.set()
         out *= self.gain
         rms = float(np.sqrt(np.mean(out * out))) if filled else 0.0
+        self.out_rms = rms
+        if filled:
+            self.last_audio_t = time.monotonic()
         target = min(1.0, rms * 6.0)
         self.level += (target - self.level) * (0.6 if target > self.level else 0.25)
         outdata[:, 0] = np.clip(out, -1.0, 1.0)

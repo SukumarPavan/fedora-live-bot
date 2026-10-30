@@ -129,6 +129,7 @@ DEFAULTS: dict[str, Any] = {
         "about_me": "",
         "language": "english_telugu",
         "subtitles": True,
+        "status_pill": True,
         "subtitle_seconds": 7,
     },
     "look": {
@@ -202,11 +203,12 @@ DEFAULTS: dict[str, Any] = {
         "input_device": "",
         "output_device": "",
         "vad_threshold": 0.5,
-        "silence_ms": 700,
+        "silence_ms": 600,
         "min_speech_ms": 250,
         "barge_in": True,
         "barge_threshold": 0.85,
         "barge_ms": 300,
+        "echo_margin": 2.5,        # while the bot talks you must be this much louder than its echo
         "half_duplex": False,
     },
     "eyes": {

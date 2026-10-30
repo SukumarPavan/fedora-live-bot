@@ -12,6 +12,7 @@ import time
 
 import numpy as np
 
+from .echo_guard import EchoGuard
 from .engine_common import EngineContext
 from .text_utils import guess_emotion
 from .audio_io import pcm16_to_float, robotize
@@ -19,6 +20,61 @@ from .vad import make_vad
 from .vision import change_score, composite, small_gray
 
 log = logging.getLogger(__name__)
+
+CONNECT_TIMEOUT_S = 15.0
+NO_ANSWER_S = 12.0  # you spoke, but no reply audio by then: say so instead of staying silent
+
+
+async def resolve_live_model(cfg, client) -> str:
+    """The configured Live model, or for "auto" the best one this key can use."""
+    model = (cfg.get("live.model") or "auto").strip()
+    if model != "auto":
+        return model
+    names = []
+    async for m in await client.aio.models.list():
+        if "bidiGenerateContent" in (m.supported_actions or []):
+            names.append(m.name.removeprefix("models/"))
+    if not names:
+        raise RuntimeError("no Live-capable Gemini model found for this key (not found)")
+    # native-audio models answered in ~1.3 s in tests; plain "live" ones cut in too early
+    names.sort(key=lambda n: (0 if "native-audio" in n else 1 if "live" in n else 2, "preview" in n, n))
+    log.info("Live models available: %s", names)
+    return names[0]
+
+
+async def live_selftest(cfg, prompt: str = "Say exactly: Live mode works.") -> dict:
+    """Connects once, asks for a short spoken reply. Used by Settings → Check."""
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=cfg.key("gemini"))
+    t0 = time.monotonic()
+    model = await asyncio.wait_for(resolve_live_model(cfg, client), CONNECT_TIMEOUT_S)
+    conf = types.LiveConnectConfig(response_modalities=["AUDIO"],
+                                   output_audio_transcription=types.AudioTranscriptionConfig(),
+                                   speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                                       prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                           voice_name=cfg.get("live.voice") or "Charon"))))
+    audio, said, first = bytearray(), "", None
+    async with asyncio.timeout(30):
+        async with client.aio.live.connect(model=model, config=conf) as session:
+            connected = time.monotonic() - t0
+            sent = time.monotonic()
+            await session.send_realtime_input(text=prompt)
+            async for msg in session.receive():
+                sc = msg.server_content
+                if not sc:
+                    continue
+                if sc.output_transcription and sc.output_transcription.text:
+                    said += sc.output_transcription.text
+                for part in (sc.model_turn.parts if sc.model_turn and sc.model_turn.parts else []):
+                    if part.inline_data and part.inline_data.data:
+                        first = first or time.monotonic() - sent
+                        audio.extend(part.inline_data.data)
+                if sc.turn_complete:
+                    break
+    return {"model": model, "connect_s": connected, "first_audio_s": first, "said": said.strip(),
+            "pcm": pcm16_to_float(bytes(audio)) if audio else None}
+
 
 LIVE_RULES = (
     "You are speaking out loud on a live voice call. Keep it short and natural. "
@@ -46,6 +102,10 @@ class LiveEngine:
         self.last_proactive = time.monotonic()
         self.last_activity = time.monotonic()
         self.model = ""
+        self.guard = EchoGuard(self.player, float(self.cfg.get("listen.echo_margin", 2.5)))
+        self.user_spoke_t = 0.0     # last time you were heard and no reply has started yet
+        self.warned_no_answer = False
+        self.connected = False
 
     # --- thread-safe entry points (scheduled on our loop by the host) -------------
     def on_mic_block(self, block: np.ndarray) -> None:
@@ -66,11 +126,15 @@ class LiveEngine:
         self.player.clear()
 
     def settings_changed(self) -> None:
-        pass
+        self.guard.margin = float(self.cfg.get("listen.echo_margin", 2.5))
+
+    def _status(self, level: str, text: str) -> None:
+        self.bridge.status.emit("engine", level, text)
 
     # --- main loop -------------------------------------------------------------------
     async def run(self) -> None:
         backoff = 2.0
+        fails = 0
         while True:
             started = time.monotonic()
             try:
@@ -80,12 +144,23 @@ class LiveEngine:
             except Exception as e:
                 msg = self._friendly(e)
                 log.warning("Live session ended: %r", e)
-                self.bridge.notice.emit(msg)
-                if "key" in msg.lower() and "rejected" in msg.lower():
+                self.connected = False
+                fails += 1
+                if "not found" in str(e).lower() or "not supported" in str(e).lower():
+                    self.model = ""  # re-pick the model next time
+                if "rejected" in msg.lower() or "free limit" in msg.lower():
+                    self._status("error", msg)
+                    self.bridge.notice.emit(msg)
                     self.bridge.emotion.emit("error", 0)
-                    return
+                    if "rejected" in msg.lower():
+                        return
+                    await asyncio.sleep(60)
+                    continue
+                if fails <= 1 or fails % 5 == 0:  # don't spam the bubble on flaky networks
+                    self.bridge.notice.emit(msg)
+                self._status("warn", f"Live reconnecting in {int(backoff)} s…")
             if time.monotonic() - started > 60:
-                backoff = 2.0
+                backoff, fails = 2.0, 0
             self.player.clear()
             self.bridge.state.emit("idle")
             await asyncio.sleep(backoff)
@@ -103,19 +178,7 @@ class LiveEngine:
         return f"Live connection dropped ({s[:120]}). Reconnecting…"
 
     async def _resolve_model(self, client) -> str:
-        model = (self.cfg.get("live.model") or "auto").strip()
-        if model != "auto":
-            return model
-        names = []
-        async for m in await client.aio.models.list():
-            if "bidiGenerateContent" in (m.supported_actions or []):
-                names.append(m.name.removeprefix("models/"))
-        if not names:
-            raise RuntimeError("no Live-capable Gemini model found for this key (not found)")
-        names.sort(key=lambda n: (0 if "native-audio" in n else 1 if "live" in n else 2,
-                                  "preview" in n, n))
-        log.info("Live models available: %s", names)
-        return names[0]
+        return await resolve_live_model(self.cfg, client)
 
     def _config(self):
         from google.genai import types
@@ -149,20 +212,27 @@ class LiveEngine:
         from google import genai
         key = self.cfg.key("gemini")
         if not key:
+            self._status("error", "Live mode needs a Gemini key (Settings → Brain)")
             self.bridge.notice.emit("Live mode needs a Gemini API key. Open Settings → Brain.")
             await asyncio.sleep(3600)
             return
         opts = {"api_version": "v1alpha"} if self.cfg.get("live.affective") else None
         client = genai.Client(api_key=key, http_options=opts)
+        self._status("busy", "Live connecting…")
         if not self.model:
-            self.model = await self._resolve_model(client)
+            self.model = await asyncio.wait_for(self._resolve_model(client), CONNECT_TIMEOUT_S)
         log.info("Connecting Gemini Live (%s)", self.model)
-        async with client.aio.live.connect(model=self.model, config=self._config()) as session:
+        cm = client.aio.live.connect(model=self.model, config=self._config())
+        session = await asyncio.wait_for(cm.__aenter__(), CONNECT_TIMEOUT_S)
+        try:
+            self.connected = True
+            log.info("Gemini Live connected (%s)", self.model)
+            self._status("ok", "Live connected")
             if not self.handle:
-                self.bridge.notice.emit("Live mode connected.")
+                self.bridge.notice.emit("Live mode connected. Talk to me!")
             tasks = [asyncio.ensure_future(t) for t in (
                 self._send_audio(session), self._send_video(session),
-                self._send_text(session), self._receive(session))]
+                self._send_text(session), self._receive(session), self._no_answer_watch())]
             try:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
                 for t in done:
@@ -172,6 +242,23 @@ class LiveEngine:
                 for t in tasks:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self.connected = False
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    async def _no_answer_watch(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            if self.user_spoke_t and not self.warned_no_answer and \
+                    time.monotonic() - self.user_spoke_t > NO_ANSWER_S:
+                self.warned_no_answer = True
+                log.warning("Live heard you but sent no reply for %.0f s", NO_ANSWER_S)
+                self._status("warn", "Live heard you but isn't answering")
+                self.bridge.notice.emit("Gemini Live heard you but isn't answering. It may be busy; "
+                                        "try again, or switch to Universal mode (Engine button).")
 
     async def _send_audio(self, session) -> None:
         from google.genai import types
@@ -180,11 +267,12 @@ class LiveEngine:
         while True:
             block = await self.q.get()
             prob = self.vad(block)
-            if self.player.active:
+            if self.guard.bot_audible():
                 if g("listen.half_duplex") or not g("listen.barge_in"):
                     continue
                 need = max(1, int(int(g("listen.barge_ms", 300)) / 32))
-                self.gate_run = self.gate_run + 1 if prob >= float(g("listen.barge_threshold", 0.85)) else 0
+                is_user = self.guard.is_user(block, prob, float(g("listen.barge_threshold", 0.85)))
+                self.gate_run = self.gate_run + 1 if is_user else 0
                 self.preroll.append(block)
                 if self.gate_run < need:
                     continue
@@ -268,6 +356,8 @@ class LiveEngine:
                         self.turn_done = False
                     self.user_buf += sc.input_transcription.text
                     self.last_activity = time.monotonic()
+                    if not self.player.active:
+                        self.user_spoke_t = time.monotonic()
                     self.bridge.user_text.emit(self.user_buf.strip())
                 if sc.output_transcription and sc.output_transcription.text:
                     self.turn_done = False
@@ -283,6 +373,10 @@ class LiveEngine:
                             if not self.player.active:
                                 self.bridge.state.emit("speaking")
                             self.player.play(pcm)
+                            self.user_spoke_t = 0.0
+                            if self.warned_no_answer:
+                                self.warned_no_answer = False
+                                self._status("ok", "Live connected")
                 if sc.turn_complete:
                     self._finish_turn()
 

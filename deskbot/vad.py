@@ -93,7 +93,8 @@ class Endpointer:
             maxlen=max(1, int(self.p.preroll_ms / self.block_ms)))
         self.last_prob = 0.0
 
-    def feed(self, block: np.ndarray, bot_speaking: bool = False) -> list[tuple[str, object]]:
+    def feed(self, block: np.ndarray, bot_speaking: bool = False, gate=None) -> list[tuple[str, object]]:
+        """gate(block, prob, threshold) -> bool can veto speech starts while the bot is audible."""
         prob = self.vad(block)
         self.last_prob = prob
         events: list[tuple[str, object]] = []
@@ -103,7 +104,10 @@ class Endpointer:
 
         if not self.in_speech:
             self.pre.append(block)
-            self.run = self.run + 1 if prob >= start_thr else 0
+            voiced = prob >= start_thr
+            if bot_speaking and gate is not None:
+                voiced = gate(block, prob, start_thr)
+            self.run = self.run + 1 if voiced else 0
             if self.run >= start_blocks:
                 self.in_speech = True
                 self.frames = list(self.pre)

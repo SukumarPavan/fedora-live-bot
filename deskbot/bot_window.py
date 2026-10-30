@@ -533,3 +533,65 @@ class Bubble(QWidget):
             p.setPen(QColor(245, 245, 248))
             p.drawText(QRect(12, int(y), self.width() - 24, br.height() + 4), Qt.TextWordWrap, self.bot)
         p.end()
+
+
+# ----------------------------------------------------------------------------------------
+# status pill: always says what the bot is doing or what is wrong
+
+
+class StatusPill(QWidget):
+    clicked = Signal()
+    COLORS = {"ok": QColor(70, 200, 110), "busy": QColor(80, 160, 255), "warn": QColor(255, 190, 60),
+              "error": QColor(255, 70, 70), "off": QColor(150, 150, 150)}
+
+    def __init__(self, cfg: Settings):
+        super().__init__(None)
+        self.cfg = cfg
+        _setup_overlay(self, cfg.get("window.overlay_mode", "overlay"))
+        self.level = "off"
+        self.text = ""
+        self.font_ = QFont()
+        self.font_.setPointSizeF(8.5)
+        self.setToolTip("Status. Click for Settings → Check")
+
+    def set_status(self, level: str, text: str) -> None:
+        if (level, text) == (self.level, self.text):
+            return
+        self.level, self.text = level, text
+        fm = QFontMetrics(self.font_)
+        shown = fm.elidedText(text, Qt.ElideRight, 260)
+        self._shown = shown
+        self.setFixedSize(fm.horizontalAdvance(shown) + 30, fm.height() + 8)
+        self.update()
+
+    def follow(self, bot: QWidget) -> None:
+        g = bot.geometry()
+        scr = QGuiApplication.screenAt(g.center()) or QGuiApplication.primaryScreen()
+        r = scr.availableGeometry()
+        x = min(max(g.center().x() - self.width() // 2, r.left()), r.right() - self.width())
+        y = g.bottom() - 4
+        if y + self.height() > r.bottom():
+            y = g.top() - self.height()
+        self.move(x, y)
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setBrush(QColor(18, 20, 24, 225))
+        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1),
+                          self.height() / 2, self.height() / 2)
+        c = self.COLORS.get(self.level, self.COLORS["off"])
+        if self.level == "busy":
+            c.setAlphaF(0.55 + 0.45 * abs(math.sin(time.monotonic() * 3)))
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        p.drawEllipse(QPointF(11, self.height() / 2), 4, 4)
+        p.setFont(self.font_)
+        p.setPen(QColor(235, 237, 242))
+        p.drawText(QRect(20, 0, self.width() - 24, self.height()), Qt.AlignVCenter, getattr(self, "_shown", ""))
+        p.end()
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit()
