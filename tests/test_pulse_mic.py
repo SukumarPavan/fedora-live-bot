@@ -34,11 +34,18 @@ def test_probe_tells_silence_from_sound():
     assert 0 <= pulse_mic.probe_peak("deskbot_ec_source") < pulse_mic.DEAD_PEAK
 
 
-def test_auto_skips_dead_echo_cancel_and_repairs_default(broken_default):
+def test_auto_never_uses_echo_cancel_and_repairs_default(broken_default):
     name, report, notice = pulse_mic.choose_source("")
     assert name == "real_mic"
     assert pulse_mic.default_source() == "real_mic"
-    assert "SILENT" in report[0] and "switched your system mic back" in notice
+    assert not any("deskbot_ec" in line and "peak" in line for line in report)   # never even probed
+    assert "set your system mic back" in notice
+
+
+def test_auto_uses_the_system_default_mic_first():
+    pulse_mic.set_default_source("real_mic")
+    name, report, notice = pulse_mic.choose_source("")
+    assert name == "real_mic" and len(report) == 1 and notice == ""
 
 
 def test_explicit_choice_is_respected():

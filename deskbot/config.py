@@ -167,6 +167,7 @@ DEFAULTS: dict[str, Any] = {
         "max_tokens": 600,
         "history_turns": 12,
         "reasoning_effort": "default",  # default | none | low | medium | high
+        "cross_backup": True,           # answer through Groq if this provider fails completely
     },
     "ears": {
         "provider": "groq",
@@ -205,6 +206,7 @@ DEFAULTS: dict[str, Any] = {
         "vad_threshold": 0.5,
         "silence_ms": 600,
         "min_speech_ms": 250,
+        "interrupt_mode": "smart",  # smart | finish (UI for barge_in/half_duplex)
         "barge_in": True,
         "barge_threshold": 0.85,
         "barge_ms": 300,

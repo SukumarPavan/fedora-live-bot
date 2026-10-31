@@ -19,19 +19,21 @@ The installer:
 1. installs a few system packages with `dnf` (it asks for your password),
 2. sets up a private Python environment in `~/.local/share/deskbot`,
 3. adds **DeskBot** to your app menu and a `deskbot` command,
-4. optionally turns on PipeWire **echo cancellation**, so you can use speakers,
+4. uses your normal system mic (and removes the echo-cancel mic older versions added),
 5. optionally starts DeskBot when you log in.
 
 ## First run: add your free keys
 
-Settings opens automatically. On the **Brain (AI)** tab, paste:
+Settings opens automatically. On the **API Keys** page, paste:
 
 | Key | Used for | Get it |
 | --- | --- | --- |
 | **Groq** | Hearing you (Whisper) | https://console.groq.com/keys |
-| **Gemini** | Thinking, seeing, and Live mode | https://aistudio.google.com/apikey |
+| **Gemini** | Thinking, seeing, and Gemini Live mode | https://aistudio.google.com/apikey → Create API key |
 
-Click **Test brain**, then on the **Hearing** tab click **Test hearing**. Done.
+Click **Test** next to each key, then open the **Test** page and click **Test everything**.
+Green = works; red says exactly what to fix. If Gemini fails but Groq works, the bot still
+answers through Groq (it just can't see images) until you fix the Gemini key.
 
 ## Using it
 
@@ -64,9 +66,11 @@ deskbot --selftest --screen   # also grabs one real screen frame
 deskbot --reset-position      # bot lost off-screen
 ```
 
-- **It keeps interrupting itself:** enable echo cancellation (re-run `install.sh`), use headphones, raise *Interrupt needs voice confidence* (Hearing tab), or tick *Mute the mic while the bot talks*.
-- **Screen sight fails on GNOME:** you must pick a monitor in GNOME's dialog the first time. Packages needed: `pipewire-gstreamer gstreamer1-plugins-good`. *Forget chosen monitor* (Eyes tab) brings the dialog back.
-- **The bot can't stay on top / move:** keep *Use XWayland* on (Look & Move tab). If it still misbehaves, switch *Window mode* to *Normal window* and restart.
+- **Not sure what works?** Click the status pill under the bot (or right-click → *Test everything…*).
+- **It keeps interrupting itself:** Settings → Talking → *When I talk while it speaks* → **Let it finish** (click the bot to stop it early), or use headphones.
+- **Gemini says the key is disabled / rejected:** make a new key at aistudio.google.com/apikey and paste it on Settings → API Keys.
+- **Screen sight fails on GNOME:** you must pick a monitor in GNOME's dialog the first time. Packages needed: `pipewire-gstreamer gstreamer1-plugins-good`. *Forget the chosen screen* (Eyes page) brings the dialog back.
+- **The bot can't stay on top / move:** keep *Use XWayland* on (Settings → Advanced → Window). If it still misbehaves, switch *Window mode* to *Normal window* and restart.
 - **Free limit reached:** switch the brain to another provider (Groq ↔ Gemini ↔ OpenRouter) in Settings.
 - Logs: `~/.local/state/deskbot/deskbot.log`. Known limitations: [NOTES.md](NOTES.md).
 

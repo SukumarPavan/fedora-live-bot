@@ -118,25 +118,25 @@ def probe_peak(name: str, seconds: float = 1.0) -> float:
 
 
 def choose_source(preferred: str = "") -> tuple[str, list[str], str]:
-    """Pick the mic to use. Returns (source_name, report_lines, user_notice)."""
+    """Pick the mic to use. Returns (source_name, report_lines, user_notice).
+
+    Auto = the system (GNOME) default mic. DeskBot's old echo-cancel source is never picked
+    automatically: on the user's laptop it delivered silence. Other mics are only tried when
+    the default is silent or missing."""
     sources = {s.name: s for s in list_sources() if not s.monitor}
     if preferred:
         if preferred in sources:
             return preferred, [f"Using the mic chosen in Settings: {sources[preferred].description}"], ""
-        notice = "The mic chosen in Settings is gone; picking one automatically."
+        notice = "The mic chosen in Settings is gone; using the system mic."
     else:
         notice = ""
     default = default_source()
-    order = []
-    if EC_SOURCE in sources:
-        order.append(EC_SOURCE)
-    if default in sources and default not in order:
-        order.append(default)
-    order += [n for n in sources if n not in order]
+    candidates = {n: s for n, s in sources.items() if not n.startswith("deskbot_")}
+    order = ([default] if default in candidates else []) + [n for n in candidates if n != default]
     report = []
     chosen = ""
     for name in order:
-        src = sources[name]
+        src = candidates[name]
         if src.muted:
             report.append(f"{src.description}: muted, skipped")
             continue
@@ -147,17 +147,17 @@ def choose_source(preferred: str = "") -> tuple[str, list[str], str]:
             chosen = name
             break
     if not chosen:
-        chosen = default if default in sources else (order[0] if order else "")
-        notice = notice or ("Every microphone I tried is silent or muted. Check the mute switch / "
-                            "volume in GNOME Settings → Sound → Input.")
+        chosen = order[0] if order else ""
+        notice = notice or ("Your microphone is silent or muted. Check the mute switch / volume in "
+                            "GNOME Settings → Sound → Input.")
         return chosen, report, notice
-    # The old installer made the echo-cancel source the system default; if that is dead,
-    # every app gets silence. Put the system default back on a mic that works.
-    if default == EC_SOURCE and chosen != EC_SOURCE:
-        if set_default_source(chosen):
-            report.append(f"System default mic was the silent echo-cancel source; reset to {chosen}")
-            notice = (f"Echo cancellation wasn't passing any sound, so I switched your system mic back "
-                      f"to {sources[chosen].description}.")
+    if default not in candidates and set_default_source(chosen):
+        # the old installer made its echo-cancel source the system default: undo that
+        report.append(f"System default mic was {default or 'unset'}; reset to {chosen}")
+        notice = notice or f"I set your system mic back to {sources[chosen].description}."
+    elif chosen != default and default in candidates:
+        notice = notice or (f"Your system mic ({candidates[default].description}) is silent, so I'm "
+                            f"listening on {sources[chosen].description}.")
     return chosen, report, notice
 
 

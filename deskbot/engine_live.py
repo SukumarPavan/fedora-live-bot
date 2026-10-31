@@ -25,15 +25,44 @@ CONNECT_TIMEOUT_S = 15.0
 NO_ANSWER_S = 12.0  # you spoke, but no reply audio by then: say so instead of staying silent
 
 
+DEFAULT_LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"  # answered in ~1.3 s in tests (2026-10)
+
+
+def explain_live_error(e: BaseException) -> str:
+    """Plain-language reason for a Gemini Live failure."""
+    from .llm import key_problem
+    s = str(e) or type(e).__name__
+    low = s.lower()
+    bad_key = key_problem(s, "gemini")
+    if bad_key:
+        return bad_key
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return "Gemini Live didn't answer in time (busy or blocked network). Try again in a minute."
+    if "quota" in low or "429" in s or "resource_exhausted" in low:
+        return "Gemini Live free limit reached. Wait a bit, or switch to Universal mode."
+    if "not found" in low or "not supported" in low:
+        return "That Live model isn't available for your key. Settings → Advanced → Gemini Live → Model: Auto."
+    if "1007" in s or "1011" in s or "1008" in s:
+        return f"Gemini Live closed the connection ({s[:100]})."
+    return f"Gemini Live problem: {s[:140]}"
+
+
 async def resolve_live_model(cfg, client) -> str:
     """The configured Live model, or for "auto" the best one this key can use."""
     model = (cfg.get("live.model") or "auto").strip()
     if model != "auto":
         return model
     names = []
-    async for m in await client.aio.models.list():
-        if "bidiGenerateContent" in (m.supported_actions or []):
-            names.append(m.name.removeprefix("models/"))
+    try:
+        async for m in await client.aio.models.list():
+            if "bidiGenerateContent" in (m.supported_actions or []):
+                names.append(m.name.removeprefix("models/"))
+    except Exception as e:
+        from .llm import key_problem
+        if key_problem(str(e), "gemini"):
+            raise
+        log.warning("Couldn't list Live models (%s); using %s", e, DEFAULT_LIVE_MODEL)
+        return DEFAULT_LIVE_MODEL
     if not names:
         raise RuntimeError("no Live-capable Gemini model found for this key (not found)")
     # native-audio models answered in ~1.3 s in tests; plain "live" ones cut in too early
@@ -148,11 +177,12 @@ class LiveEngine:
                 fails += 1
                 if "not found" in str(e).lower() or "not supported" in str(e).lower():
                     self.model = ""  # re-pick the model next time
-                if "rejected" in msg.lower() or "free limit" in msg.lower():
-                    self._status("error", msg)
+                key_bad = "key" in msg.lower() and ("rejected" in msg.lower() or "disabled" in msg.lower())
+                if key_bad or "free limit" in msg.lower():
+                    self._status("error", "Live: Gemini key problem" if key_bad else "Live: free limit reached")
                     self.bridge.notice.emit(msg)
                     self.bridge.emotion.emit("error", 0)
-                    if "rejected" in msg.lower():
+                    if key_bad:
                         return
                     await asyncio.sleep(60)
                     continue
@@ -167,15 +197,10 @@ class LiveEngine:
             backoff = min(backoff * 2, 30.0)
 
     def _friendly(self, e: Exception) -> str:
-        s = str(e)
-        low = s.lower()
-        if "api key" in low or "api_key" in low or "permission" in low or "1008" in s:
-            return "Gemini rejected my key or model for Live mode. Check Settings → Brain / Live."
-        if "quota" in low or "429" in s or "resource_exhausted" in low:
-            return "Gemini Live free limit reached. Switch to Universal mode or wait a bit."
-        if "not found" in low or "not supported" in low:
-            return "That Live model isn't available. Settings → Live → Fetch models."
-        return f"Live connection dropped ({s[:120]}). Reconnecting…"
+        msg = explain_live_error(e)
+        if msg.startswith("Gemini Live problem") or msg.startswith("Gemini Live closed"):
+            return msg + " Reconnecting…"
+        return msg
 
     async def _resolve_model(self, client) -> str:
         return await resolve_live_model(self.cfg, client)

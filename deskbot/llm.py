@@ -66,12 +66,31 @@ def _new_client(cfg: Settings, provider: str, timeout: float, max_retries: int) 
     return openai.AsyncOpenAI(base_url=base, api_key=key, timeout=timeout, max_retries=max_retries)
 
 
+KEY_HELP = {
+    "gemini": "Make a NEW key at aistudio.google.com/apikey → Create API key, and paste it on Settings → API Keys.",
+    "groq": "Make a new key at console.groq.com/keys and paste it on Settings → API Keys.",
+}
+
+
+def key_problem(text: str, provider: str) -> str | None:
+    """A clear message if an error text means the API key itself is bad, else None."""
+    t = text.lower()
+    label = PROVIDERS.get(provider, {}).get("label", provider).removeprefix("Google ")
+    fix = KEY_HELP.get(provider, "Check it on Settings → API Keys.")
+    if "account_state_invalid" in t or "service account" in t:
+        return f"Google has disabled this {label} key (its account was deleted or turned off). {fix}"
+    if any(w in t for w in ("api_key_invalid", "api key not valid", "invalid api key", "invalid_api_key",
+                            "incorrect api key", "unauthenticated", "unauthorized", "401", "permission_denied")):
+        return f"My {label} key was rejected. {fix}"
+    return None
+
+
 def friendly_error(e: Exception, provider: str) -> str:
     label = PROVIDERS.get(provider, {}).get("label", provider)
     if isinstance(e, ApiError):
         return str(e)
-    if isinstance(e, openai.AuthenticationError):
-        return f"My {label} key was rejected. Check it in Settings."
+    if isinstance(e, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return key_problem(_short(e), provider) or f"My {label} key was rejected. {KEY_HELP.get(provider, '')}"
     if isinstance(e, openai.RateLimitError):
         return f"{label} free limit reached. Give me a minute."
     if isinstance(e, openai.NotFoundError):
@@ -82,8 +101,9 @@ def friendly_error(e: Exception, provider: str) -> str:
         return f"{label} took too long to answer."
     if isinstance(e, openai.APIStatusError):
         text = _short(e).lower()
-        if "api key" in text or "api_key" in text or "unauthorized" in text:
-            return f"My {label} key was rejected. Check it in Settings."
+        bad_key = key_problem(text, provider)
+        if bad_key and e.status_code in (400, 401, 403):
+            return bad_key
         if "quota" in text or "rate limit" in text or "resource_exhausted" in text:
             return f"{label} free limit reached. Give me a minute."
         if "model" in text and ("not found" in text or "does not exist" in text or "not supported" in text):
@@ -143,6 +163,7 @@ class ChatOptions:
     no_reasoning_param: set[str] = set()
     no_vision: set[str] = set()
     cooldown: dict[str, float] = {}   # ident -> monotonic time until which it is skipped
+    key_failed: dict[str, float] = {}  # provider -> until when its key is known bad
 
 
 def _strip_images(messages: list[dict]) -> list[dict]:
@@ -167,8 +188,7 @@ def model_chain(cfg: Settings) -> list[str]:
     return ok + [m for m in chain if m not in ok]
 
 
-async def _open_stream(client, cfg: Settings, model: str, messages: list[dict]):
-    provider = cfg.get("brain.provider")
+async def _open_stream(client, cfg: Settings, model: str, messages: list[dict], provider: str):
     ident = f"{provider}:{model}"
     kwargs = {"model": model, "temperature": float(cfg.get("brain.temperature", 0.8)),
               "max_tokens": int(cfg.get("brain.max_tokens", 600)), "stream": True}
@@ -198,17 +218,45 @@ async def _open_stream(client, cfg: Settings, model: str, messages: list[dict]):
     raise ApiError("The AI rejected the request.")
 
 
+BACKUP_BRAIN = ("groq", "openai/gpt-oss-20b")  # text-only, ~1 s on Groq's free tier
+_backup_noted = {"done": False}
+
+
 async def chat_stream(cfg: Settings, messages: list[dict]) -> AsyncIterator[str]:
+    """Streams the reply. If the chosen provider fails completely (bad key, outage) and a Groq
+    key exists, answers through Groq instead of leaving the user in silence."""
     provider = cfg.get("brain.provider")
+    try:
+        async for t in _chat_on(cfg, provider, model_chain(cfg), messages):
+            yield t
+        return
+    except ApiError as e:
+        bp, bm = BACKUP_BRAIN
+        if provider == bp or not cfg.key(bp) or not cfg.get("brain.cross_backup", True):
+            raise
+        log.warning("Brain %s failed (%s); answering through backup %s/%s", provider, e, bp, bm)
+        primary_err = "" if _backup_noted["done"] else str(e)
+        _backup_noted["done"] = True
+    async for t in _chat_on(cfg, bp, [bm], _strip_images(messages)):
+        yield t
+    if primary_err:
+        raise BackupUsed(primary_err)
+
+
+class BackupUsed(ApiError):
+    """Raised AFTER a complete backup answer: the caller may tell the user once why."""
+
+
+async def _chat_on(cfg: Settings, provider: str, chain: list[str], messages: list[dict]) -> AsyncIterator[str]:
     client = make_client(cfg, provider, timeout=30, max_retries=0)
     last: Exception | None = None
     try:
-        for model in model_chain(cfg):
+        for model in chain:
             ident = f"{provider}:{model}"
             started = False
             try:
                 t0 = time.monotonic()
-                it = (await _open_stream(client, cfg, model, messages)).__aiter__()
+                it = (await _open_stream(client, cfg, model, messages, provider)).__aiter__()
                 while True:
                     try:
                         chunk = await asyncio.wait_for(it.__anext__(), 30 if started else FIRST_TOKEN_TIMEOUT)
@@ -225,6 +273,9 @@ async def chat_stream(cfg: Settings, messages: list[dict]) -> AsyncIterator[str]
                     return
                 last = ApiError(f"{model} gave an empty answer")
                 log.warning("Brain %s gave an empty answer; trying a backup", model)
+            except (openai.AuthenticationError, openai.PermissionDeniedError) as e:
+                ChatOptions.key_failed[provider] = time.monotonic() + 300
+                raise ApiError(friendly_error(e, provider)) from e  # same key for every model
             except BACKUP_ERRORS as e:
                 if started:
                     raise ApiError(friendly_error(e, provider)) from e
@@ -245,7 +296,13 @@ async def chat_stream(cfg: Settings, messages: list[dict]) -> AsyncIterator[str]
 
 
 async def complete(cfg: Settings, messages: list[dict]) -> str:
-    return "".join([t async for t in chat_stream(cfg, messages)])
+    out = []
+    try:
+        async for t in chat_stream(cfg, messages):
+            out.append(t)
+    except BackupUsed:
+        pass
+    return "".join(out)
 
 
 async def list_models(cfg: Settings, provider: str) -> list[str]:

@@ -599,6 +599,7 @@ class Controller(QObject):
         act("Stop talking", lambda: self.host.engine and self.host.call(self.host.engine.interrupt))
         m.addSeparator()
         act("Chat window", self.open_chat)
+        act("Test everything…", lambda: self.open_settings(check=True))
         act("Settings…", self.open_settings)
         act("Hide for 10 minutes", lambda: self.hide_for(10))
         m.addSeparator()

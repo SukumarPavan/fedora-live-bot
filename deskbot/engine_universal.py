@@ -247,6 +247,7 @@ class UniversalEngine:
         say_q: asyncio.Queue[str | None] = asyncio.Queue()
         speaker = asyncio.ensure_future(self._speak(say_q, gen))
         full, buf, tag_done, skipped = "", "", False, False
+        backup_note = ""
         try:
             if not proactive:
                 self.bridge.state.emit("thinking")
@@ -276,6 +277,8 @@ class UniversalEngine:
                 self.bridge.bot_text.emit(strip_tags(full), False)
             if not skipped and buf.strip() and gen == self.gen:
                 await say_q.put(buf.strip())
+        except llm.BackupUsed as e:
+            backup_note = str(e)
         except llm.ApiError as e:
             if gen == self.gen:
                 self._fail(str(e), keep_speaking=True)
@@ -308,7 +311,13 @@ class UniversalEngine:
             self.bridge.bot_text.emit(reply, True)
             self.recent_speech.append((time.monotonic(), reply))
             log.info("Replied: %r", reply[:200])
-            self._status("ok", "Ready")
+            if backup_note:
+                self.bridge.notice.emit(f"{backup_note} Meanwhile I'm answering through Groq (I can't see "
+                                        "images that way).")
+            if backup_note or llm._backup_noted["done"] and self._primary_failing():
+                self._status("warn", "Using Groq backup brain (check Gemini key)")
+            else:
+                self._status("ok", "Ready")
             vision_note = llm.vision_note(self.cfg)
             if vision_note and images:
                 self.bridge.notice.emit(vision_note)
@@ -333,6 +342,12 @@ class UniversalEngine:
             self.player.play(pcm)
         while self.player.active and gen == self.gen:
             await asyncio.sleep(0.05)
+
+    def _primary_failing(self) -> bool:
+        p = self.cfg.get("brain.provider")
+        now = time.monotonic()
+        return any(k.startswith(p + ":") and t > now for k, t in llm.ChatOptions.cooldown.items()) or \
+            llm.ChatOptions.key_failed.get(p, 0) > now
 
     def _idle(self) -> None:
         self.busy = False

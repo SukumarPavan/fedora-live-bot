@@ -6,6 +6,13 @@
 - Edge TTS host is blocked in the sandbox, so voices were never heard here.
 - Windows 11 path: written, never run.
 
+## 2026-10-31 round 3 (user feedback: Live 401, messy settings, echo mic never listens)
+- The user's Gemini key returns **401 ACCOUNT_STATE_INVALID** ("bound service account is deleted or disabled") for every call, including Live. It's a dead key on Google's side, not the app. `llm.key_problem` maps every bad-key error to one plain message with the fix (new key at aistudio.google.com/apikey).
+- If the brain provider fails completely and a Groq key exists, the reply comes through Groq `openai/gpt-oss-20b` (text only). The user is told once, and the pill shows "Using Groq backup brain".
+- The echo-cancel mic never listened on the user's laptop. Auto mic = system default; `deskbot_*` sources are never chosen automatically. The installer now deletes the old echo-cancel config instead of creating it.
+- Settings is now a dark sidebar window: Test, API Keys (each key says what it is used for and has a Test button), Talking, Bot, Eyes, Advanced (expert knobs).
+- Interrupt behavior is one dropdown: "Stop and listen (smart)" or "Let it finish" (half-duplex).
+
 ## Visibility (2026-10-31: "is it working or not?")
 - A status pill under the bot always shows Listening / Thinking / Speaking / Live connected / the current error. Click it to open Settings → Check, which has a Test button for mic, hearing, brain, voice, Live, screen and camera.
 - Never silent: Universal gives up after 20 s with a message. Live warns if it heard you but sent no reply within 12 s. Live connect has a 15 s timeout. Reconnects show "Live reconnecting in N s" instead of spamming bubbles.

@@ -91,46 +91,20 @@ EOF
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$HOME/.local/share/applications" || true
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
 
-say "5/6 Echo cancellation (use speakers without the bot hearing itself)"
-if command -v pipewire >/dev/null 2>&1; then
-  if ask "Enable PipeWire echo cancellation for DeskBot? (audio restarts for a second)" Y; then
-    mkdir -p "$(dirname "$EC_CONF")"
-    cat > "$EC_CONF" <<'EOF'
-# Added by DeskBot install.sh; removed by uninstall.sh.
-# Cancels whatever your speakers play (including the bot's voice) from the microphone.
-context.modules = [
-  { name = libpipewire-module-echo-cancel
-    flags = [ nofail ]
-    args = {
-      library.name = aec/libspa-aec-webrtc
-      monitor.mode = true
-      capture.props = { node.name = "deskbot_ec_capture" }
-      source.props  = { node.name = "deskbot_ec_source" node.description = "Echo-cancelled mic (DeskBot)" }
-      sink.props    = { node.name = "deskbot_ec_monitor" }
-    }
-  }
-]
-EOF
-    systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
-    sleep 3
-    # Never make it the system default: on some setups it outputs pure silence, which mutes
-    # every app. DeskBot itself tests it and only uses it when it really passes sound.
-    if command -v pactl >/dev/null 2>&1 && pactl list short sources 2>/dev/null | grep -q deskbot_ec_source; then
-      echo "Echo-cancelled mic created. DeskBot will use it only if it passes sound."
-    else
-      echo "Echo-cancel source did not appear (your PipeWire may lack the WebRTC plugin)."
-      echo "No harm done. Use headphones or raise 'Interrupt needs voice confidence' in Settings."
-    fi
-  fi
-else
-  echo "PipeWire not found; skipping."
+say "5/6 Microphone"
+# DeskBot uses your normal system mic. Older versions added a PipeWire echo-cancel mic that gave
+# silence on some laptops: remove it if it is still there.
+if [[ -f "$EC_CONF" ]]; then
+  rm -f "$EC_CONF"
+  systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+  sleep 2
+  echo "Removed DeskBot's old echo-cancel mic."
 fi
-
-# Older versions set the echo-cancel source as the system default mic: undo that.
-if command -v pactl >/dev/null 2>&1 && [[ "$(pactl get-default-source 2>/dev/null)" == deskbot_ec_source ]]; then
+if command -v pactl >/dev/null 2>&1 && [[ "$(pactl get-default-source 2>/dev/null)" == deskbot_* ]]; then
   real=$(pactl list short sources 2>/dev/null | awk '{print $2}' | grep -v -e '\.monitor$' -e '^deskbot_' | head -1)
   [[ -n "$real" ]] && pactl set-default-source "$real" && echo "Restored your system mic to: $real"
 fi
+echo "Using your system mic (change it in GNOME Settings → Sound, or in DeskBot → Settings → Talking)."
 
 say "6/6 Start automatically when you log in?"
 AUTO="$CONF/autostart/deskbot.desktop"
